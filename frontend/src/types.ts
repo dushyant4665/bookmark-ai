@@ -128,6 +128,7 @@ export type ChatStreamEvent =
   | 'evidence_selected'
   | 'generating'
   | 'answer_chunk'
+  | 'answer_reset'
   | 'sources_ready'
   | 'validation_complete'
   | 'complete'

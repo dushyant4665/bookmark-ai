@@ -15,7 +15,11 @@ import {
   generateNoEvidenceNote,
   noEvidenceFallback,
   plainLanguageRule,
-} from '../rag/generation.js';import { groqConfigured, completeChat, streamChatContent } from '../services/groqService.js';
+  refusedDespiteEvidence,
+  evidenceMentions,
+  SECOND_ATTEMPT_RULE,
+} from '../rag/generation.js';
+import { groqConfigured, completeChat, streamChatContent } from '../services/groqService.js';
 import { ragConfig } from '../config/rag.js';
 
 // ResearchService (Phase 3) — the reusable brain.
@@ -484,6 +488,12 @@ export async function researchQuery(input, deps = {}) {
     wholeBook: useSpread,
   };
   let generated;
+  // The same passages are sometimes answered and sometimes shrugged off, and a
+  // shrug in front of real evidence is the one reply a user should not get. Ask
+  // once more, pointedly — but only when the passages contain what the question
+  // itself asked about, so a genuine miss stays a single honest refusal.
+  const worthAskingAgain = (g) =>
+    refusedDespiteEvidence(g, evidence) && (useSpread || evidenceMentions(evidence, turn.keywords ?? []));
   if (streaming) {
     // Real token stream: forward Groq's actual deltas as answer_chunk events,
     // then validate the model's evidence selection from the structured trailer.
@@ -494,9 +504,23 @@ export async function researchQuery(input, deps = {}) {
       onDelta: (delta) => emit('answer_chunk', { delta }),
       signal,
     });
+    if (worthAskingAgain(generated)) {
+      emit('answer_reset', { reason: 'refusal_with_evidence' });
+      generated = await generateAnswerStreaming({
+        ...genArgs,
+        nudge: SECOND_ATTEMPT_RULE,
+        stream,
+        onDelta: (delta) => emit('answer_chunk', { delta }),
+        signal,
+      });
+    }
   } else {
     if (groq === completeChat && !groqConfigured()) throw new ResearchError('GROQ_NOT_CONFIGURED');
     generated = await generateAnswer({ ...genArgs, groq });
+    if (worthAskingAgain(generated)) {
+      emit('answer_reset', { reason: 'refusal_with_evidence' });
+      generated = await generateAnswer({ ...genArgs, nudge: SECOND_ATTEMPT_RULE, groq });
+    }
     emit('answer_chunk', { delta: generated.answer });
   }
   const generateMs = now() - t4;

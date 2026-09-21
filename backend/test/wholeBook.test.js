@@ -4,7 +4,12 @@ import assert from 'node:assert/strict';
 import { understandQuery } from '../src/retrieval/queryUnderstanding.js';
 import { spreadRetrieval } from '../src/retrieval/spreadRetrieval.js';
 import { researchQuery } from '../src/services/researchService.js';
-import { buildSystemPrompt } from '../src/rag/generation.js';
+import {
+  CITATION_DELIM,
+  buildSystemPrompt,
+  evidenceMentions,
+  refusedDespiteEvidence,
+} from '../src/rag/generation.js';
 import { ragConfig } from '../src/config/rag.js';
 
 // "What is the story of this book?" is not a lookup — five passages from one
@@ -136,4 +141,163 @@ test('a passage question never takes the sample path', async () => {
   });
   assert.equal(res.debug.scope, 'passage');
   assert.equal(res.debug.counts.spread, 0, 'no sample is fetched for a lookup question');
+});
+
+// ============================================================================
+// The shrug is not a stable output. The same passages get answered on one call
+// and refused on the next, and a refusal in front of real evidence is the one
+// reply the user should not see. So the pipeline asks once more, pointedly.
+// ============================================================================
+
+function refuseRun({
+  answers,
+  message = 'What does Ivan say about God?',
+  rows = [
+    chunkRow({ id: 'a', page_start: 199, source_text: 'Ivan on the tortured baby.' }),
+    chunkRow({ id: 'b', page_start: 193, source_text: 'Ivan on Christ-like love.' }),
+  ],
+}) {
+  const events = [];
+  const calls = [];
+  const run = async (sql) => {
+    const s = sql.replace(/\s+/g, ' ');
+    if (s.includes('FROM book_editions')) {
+      return { rows: [{ source_id: 'src-1', ingestion_status: 'COMPLETED', book_title: 'B', edition_label: 'E' }] };
+    }
+    if (s.includes('FROM conversations WHERE id')) {
+      return { rows: [{ id: 'c', user_id: 'u', book_id: 'b', edition_id: 'e' }] };
+    }
+    if (s.includes('FROM conversation_messages') && s.includes('ORDER BY created_at')) return { rows: [] };
+    if (s.includes('embedding <=>')) return { rows };
+    if (s.includes('search_tsv')) return { rows: [] };
+    return { rows: [] };
+  };
+  const p = researchQuery(
+    { userId: 'u', conversationId: 'c', bookId: 'b', editionId: 'e', message },
+    {
+      runQuery: run,
+      makeProvider: () => ({ embedBatch: async (t) => t.map(() => new Array(ragConfig.embeddingDim).fill(0.1)) }),
+      reranker: null,
+      groq: async (messages) => {
+        calls.push(messages[0].content);
+        return answers[calls.length - 1];
+      },
+      emit: (type, data) => events.push({ type, data }),
+    }
+  );
+  return { p, events, calls };
+}
+
+const SHRUG = JSON.stringify({ answer: 'The passages do not say.', evidenceIds: [], confidence: 'insufficient' });
+const REAL = JSON.stringify({ answer: 'Ivan returns the ticket.', evidenceIds: ['e1'], confidence: 'supported' });
+
+test('a shrug in front of real evidence is retried once, with the nudge', async () => {
+  const { p, events, calls } = refuseRun({ answers: [SHRUG, REAL] });
+  const res = await p;
+  assert.equal(calls.length, 2, 'it asked again');
+  assert.match(calls[1], /second attempt with the SAME excerpts/);
+  assert.ok(!/second attempt/.test(calls[0]), 'the first call is the plain prompt');
+  assert.equal(res.confidence, 'supported');
+  assert.equal(res.answer, 'Ivan returns the ticket.');
+  assert.equal(res.citations.length, 1);
+  assert.ok(events.some((e) => e.type === 'answer_reset'), 'the UI is told to replace the refused text');
+});
+
+test('a refusal with no evidence in hand is not treated as a shrug', () => {  const shrugged = { confidence: 'insufficient', evidenceIds: [] };
+  assert.equal(refusedDespiteEvidence(shrugged, []), false, 'nothing was retrieved, so nothing to re-ask');
+  assert.equal(refusedDespiteEvidence(shrugged, [{ evidenceId: 'e1' }]), true);
+  assert.equal(
+    refusedDespiteEvidence({ confidence: 'insufficient', evidenceIds: ['e1'] }, [{ evidenceId: 'e1' }]),
+    false,
+    'it cited something, so it did answer'
+  );
+});
+
+test('the retry happens only once, so a real miss still ends honestly', async () => {
+  const { p, calls, events } = refuseRun({ answers: [SHRUG, SHRUG, SHRUG] });
+  const res = await p;
+  assert.equal(calls.length, 2, 'one second attempt, never a loop');
+  assert.equal(res.confidence, 'insufficient');
+  assert.equal(res.answer, 'The passages do not say.');
+  assert.equal(events.filter((e) => e.type === 'answer_reset').length, 1);
+});
+
+
+// The route users actually hit streams its answer, so the retry has to work
+// there too: the refused text is replaced by the second attempt's real deltas.
+const STREAM_SHRUG = [
+  'Nothing here answers that. ',
+  `\n${CITATION_DELIM}\n{"evidenceIds":[],"confidence":"insufficient"}`,
+];
+const STREAM_ANSWER = [
+  'Ivan answers ',
+  'by returning the ticket. ',
+  `\n${CITATION_DELIM}\n{"evidenceIds":["e1"],"confidence":"supported"}`,
+];
+
+test('a streamed shrug is retried and the retried text replaces it', async () => {
+  const events = [];
+  const attempts = [STREAM_SHRUG, STREAM_ANSWER];
+  let call = 0;
+  const res = await researchQuery(
+    { userId: 'u', conversationId: 'c', bookId: 'b', editionId: 'e', message: 'What does Ivan say about God?' },
+    {
+      runQuery: async (sql) => {
+        const s = sql.replace(/\s+/g, ' ');
+        if (s.includes('FROM book_editions')) {
+          return { rows: [{ source_id: 'src-1', ingestion_status: 'COMPLETED', book_title: 'B', edition_label: 'E' }] };
+        }
+        if (s.includes('FROM conversations WHERE id')) {
+          return { rows: [{ id: 'c', user_id: 'u', book_id: 'b', edition_id: 'e' }] };
+        }
+        if (s.includes('FROM conversation_messages') && s.includes('ORDER BY created_at')) return { rows: [] };
+        if (s.includes('embedding <=>')) {
+          return {
+            rows: [
+              chunkRow({ id: 'a', page_start: 199, distance: 0.2, source_text: 'Ivan on the tortured baby.' }),
+              chunkRow({ id: 'b', page_start: 193, distance: 0.4, source_text: 'Ivan on Christ-like love.' }),
+            ],
+          };
+        }
+        if (s.includes('search_tsv') || s.includes('FROM book_pages')) return { rows: [] };
+        return { rows: [] };
+      },
+      makeProvider: () => ({ embedBatch: async (t) => t.map(() => new Array(ragConfig.embeddingDim).fill(0.1)) }),
+      reranker: null,
+      stream: async function* () { for (const part of attempts[call++]) yield part; },
+      emit: (type, data) => events.push({ type, data }),
+    }
+  );
+  const types = events.map((e) => e.type);
+  assert.equal(call, 2, 'the stream was run again');
+  assert.equal(types.filter((t) => t === 'answer_reset').length, 1);
+  assert.ok(
+    types.indexOf('answer_reset') < types.lastIndexOf('answer_chunk'),
+    'the replacement text arrives after the reset'
+  );
+  assert.equal(res.answer, 'Ivan answers by returning the ticket.');
+  assert.equal(res.confidence, 'supported');
+  assert.equal(res.citations.length, 1);
+});
+
+// A second call is only worth paying for when the passages contain what the
+// question asked about. An off-book question stays the honest refusal it is.
+test('a question the passages never mention is refused once, not retried', async () => {
+  const { p, calls, events } = refuseRun({ answers: [SHRUG, SHRUG], message: 'who won the world cup?' });
+  const res = await p;
+  assert.equal(calls.length, 1, 'no keyword of the question appears in the evidence');
+  assert.equal(events.filter((e) => e.type === 'answer_reset').length, 0);
+  assert.equal(res.confidence, 'insufficient');
+});
+
+test('evidenceMentions matches the question\'s own words, case-insensitively', () => {
+  const evidence = [{ text: 'Ivan on the tortured baby.' }];
+  assert.equal(evidenceMentions(evidence, ['ivan', 'god']), true);
+  assert.equal(evidenceMentions(evidence, ['world', 'cup']), false);
+  assert.equal(evidenceMentions(evidence, []), true, 'nothing to match is not a reason to refuse a retry');
+  assert.equal(
+    evidenceMentions([{ text: 'A woman wept by the road.' }], ['won']),
+    false,
+    'a keyword buried inside another word is not a mention'
+  );
 });

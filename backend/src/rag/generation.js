@@ -143,14 +143,18 @@ const ALLOWED_CONFIDENCE = new Set(['supported', 'partially_supported', 'insuffi
 
 // The grounding contract, shared by the JSON and streaming prompts so the two
 // cannot drift apart on the one thing users notice: when a refusal is allowed.
-function groundingRules({ wholeBook = false } = {}) {
+function groundingRules({ wholeBook = false, nudge = null } = {}) {
   return [
+    ...(nudge ? [`- ${nudge}`] : []),
     '- Do not invent facts, quotations, page numbers, chapter names, or coordinates.',
     '- Do not claim something appears in the book unless the supplied evidence supports it.',
     '- Do not fill gaps with general world knowledge. This application is book-grounded and has no web search.',
     '- Answer FIRST, qualify SECOND. If an excerpt names the person, scene or argument the question asks about, lead with what that excerpt says and cite its id; add at most one short clause about what the passages do not settle.',
     '- A passage that says the thing in different words still says the thing. It does not have to quote the question\'s phrasing to answer it, and a question you can half-answer is not a question you refuse.',
     '- "These passages do not cover that" is a last resort, true only when NO excerpt below touches the person, term or event asked about.',
+    // Keep the confidence flag honest about the answer actually written: a reply
+    // that states anything drawn from an excerpt must cite that excerpt.
+    '- Whatever you write, report it truthfully: if any sentence of your answer comes from an excerpt, list that id and use "partially_supported" or "supported". Only write "insufficient" if your answer draws on nothing below.',
     ...(wholeBook
       ? [
         `- ${wholeBookRule()}`,
@@ -165,12 +169,12 @@ function groundingRules({ wholeBook = false } = {}) {
 }
 
 // §17 — the grounding contract. Strong, explicit, and small.
-export function buildSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false } = {}) {
+export function buildSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false, nudge = null } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
     'Hard rules:',
-    ...groundingRules({ wholeBook }),
+    ...groundingRules({ wholeBook, nudge }),
     '',
     '- If supplied evidence conflicts, explain the conflict instead of silently choosing one side.',
     '',
@@ -229,7 +233,7 @@ function buildContextBlock(contextMessages = [], limit = ragConfig.contextMessag
 
 // §16/§17 — the full message array. Groq receives the question, minimal
 // conversation context, the book/edition identity, and ONLY the final evidence.
-export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false }) {
+export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false, nudge = null }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -240,7 +244,7 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: buildSystemPrompt({ answerLanguage, formNote, wholeBook }) },
+    { role: 'system', content: buildSystemPrompt({ answerLanguage, formNote, wholeBook, nudge }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -256,12 +260,12 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
 // citation truth: the ids are membership-checked and resolved to real DB rows.
 export const CITATION_DELIM = '###EVIDENCE###';
 
-function streamingSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false } = {}) {
+function streamingSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false, nudge = null } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
     'Hard rules:',
-    ...groundingRules({ wholeBook }),
+    ...groundingRules({ wholeBook, nudge }),
     '',
     'Conversation history, when present, is provided ONLY to resolve references. It is NOT evidence and never overrides the book.',
     '',
@@ -280,7 +284,7 @@ function streamingSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBo
   ].join('\n');
 }
 
-export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false }) {
+export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false, nudge = null }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -291,7 +295,7 @@ export function buildStreamingMessages({ question, evidence = [], contextMessage
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: streamingSystemPrompt({ answerLanguage, formNote, wholeBook }) },
+    { role: 'system', content: streamingSystemPrompt({ answerLanguage, formNote, wholeBook, nudge }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -350,11 +354,12 @@ export async function generateAnswerStreaming({
   answerLanguage = 'en',
   formNote = null,
   wholeBook = false,
+  nudge = null,
   stream = streamChatContent,
   onDelta = null,
   signal = null,
 }) {
-  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook });
+  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook, nudge });
   const splitter = createAnswerSplitter();
   let answer = '';
   for await (const chunk of stream(messages, { signal })) {
@@ -447,6 +452,36 @@ export function decideSufficiency(fused = [], { minCount = ragConfig.minEvidence
   };
 }
 
+// One more ask when the model waved away the evidence it was handed. This is not
+// a licence to invent: the second call sees the very same excerpts and still may
+// only cite ids from them.
+export const SECOND_ATTEMPT_RULE =
+  'This is a second attempt with the SAME excerpts, and your first reply declined to answer from them. Read them again line by line: if an excerpt quotes the person, scene or argument the question names, answer from it and list that id. Decline again only if not one excerpt below touches the subject at all.';
+
+// A shrug is legitimate when nothing was retrieved. It is not legitimate when
+// real passages are in front of the model and it cites none of them.
+export function refusedDespiteEvidence(generated, evidence = []) {
+  return evidence.length > 0
+    && generated?.confidence === 'insufficient'
+    && !(generated?.evidenceIds?.length);
+}
+
+// Cheap, deterministic check on whether a second attempt is worth paying for:
+// do the passages contain any of the words the question itself asked about? A
+// question the book cannot touch ("who won the World Cup") stays the honest
+// refusal it is, instead of costing a second model call that shrugs again.
+export function evidenceMentions(evidence = [], keywords = []) {
+  const useful = keywords.map((k) => String(k).toLowerCase().trim()).filter((k) => k.length >= 3);
+  if (!useful.length) return true; // nothing to match — let the model have its say
+  const haystack = evidence.map((e) => String(e.text ?? '')).join('\n').toLowerCase();
+  // Whole words only: "won" is not evidence about a World Cup just because
+  // some passage contains the letters inside "woman".
+  return useful.some((k) => {
+    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'u').test(haystack);
+  });
+}
+
 // Run grounded generation. `groq` is injectable for tests. Resolves model-
 // reported ids to the supplied set and clamps confidence honestly.
 export async function generateAnswer({
@@ -457,9 +492,10 @@ export async function generateAnswer({
   answerLanguage = 'en',
   formNote = null,
   wholeBook = false,
+  nudge = null,
   groq = completeChat,
 }) {
-  const messages = buildMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook });
+  const messages = buildMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook, nudge });
   const raw = await groq(messages);
   const parsed = parseStructuredAnswer(raw);
   if (!parsed) throw new Error('ANSWER_PARSE_FAILED');

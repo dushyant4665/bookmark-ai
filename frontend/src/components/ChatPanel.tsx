@@ -279,6 +279,19 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
               }
               break;
             }
+            case 'answer_reset': {
+              // The model shrugged at passages it was handed, so the backend is
+              // answering again from the same evidence. The refused text is
+              // replaced, never appended to.
+              const t = typeRef.current;
+              t.queue = '';
+              sources = [];
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantId ? { ...m, content: '', evidence: [] } : m))
+              );
+              setActivity('Writing the answer…');
+              break;
+            }
             case 'sources_ready':
               sources = readSources(data);
               break;

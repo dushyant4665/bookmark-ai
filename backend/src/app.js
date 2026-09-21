@@ -7,6 +7,10 @@ import { notFound, errorHandler } from './middleware/errorHandler.js';
 export function createApp() {
   const app = express();
   app.disable('x-powered-by');
+  // Render terminates TLS in front of us and forwards X-Forwarded-For. Without
+  // this, req.ip is the platform's address for every visitor and the per-IP
+  // auth/login limits would be shared by the whole world, not per client.
+  app.set('trust proxy', 1);
 
   app.use(
     cors({

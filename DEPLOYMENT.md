@@ -137,8 +137,37 @@ work because they come from stored coordinates, not embeddings.
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_RETRIES` / `EMBEDDING_RETRY_BASE_MS` | backfill batching + bounded retries |
 | `EMBEDDING_TIMEOUT_MS` | hard per-request ceiling so a blocked provider can't hang a job |
 | `EMBEDDING_CONCURRENCY` | keep `1` — one controlled batch at a time |
-| `CORS_ORIGINS` | your Vercel origin(s), comma-separated — never `*` |
+| `CORS_ORIGINS` | your frontend origin(s), comma-separated — never `*` |
+| `PG_POOL_MAX` / `PG_CONNECT_TIMEOUT_MS` / `PG_IDLE_TIMEOUT_MS` | optional pool tuning (defaults are fine on one instance) |
+| `RATE_LIMIT` / `RATE_LIMIT_FACTOR` | optional; keep `true`, scale with the factor |
 | `RAG_DEBUG` | unset/`false` (debug detail only when explicitly enabled) |
+
+### Render gotchas
+
+- **Database URL**: use the **direct / session pooler** connection (port `5432`).
+  The transaction pooler (`6543`, `?pgbouncer=true`) breaks session-scoped
+  features this app uses — the `search_path` option and the advisory lock that
+  keeps two embedding jobs from overlapping.
+- **Proxy**: the app sets `trust proxy`, so `X-Forwarded-For` is honoured and the
+  per-client auth/login limits stay per-client behind Render's load balancer.
+- **Free/hobby instances sleep.** A cold start aborts an in-flight SSE stream; the
+  client reports the truncated answer honestly instead of pretending it finished.
+  Keep the service awake (paid instance or a health-check pinger) if streaming
+  latency matters.
+- **One instance only** for now: rate-limit counters are in-memory, so scaling out
+  makes the limits per-instance.
+- Set the service's **Health Check Path** to `/api/health`.
+
+## 8b. Render frontend (Static Site)
+
+1. New **Static Site** → root directory `frontend`, Build `npm install && npm run
+   build`, Publish directory `dist`.
+2. Enable **SPA** in the site settings (or add `public/_redirects` with
+   `/* /index.html 200`) so client routes resolve.
+3. A static site has **no `/api` proxy** — that only exists in Vite dev. The
+   frontend must be given the absolute backend URL (see §10).
+4. After both deploy, `npm run verify:production` from the backend and load
+   `https://<frontend>/` — sign in, pick a book, ask one question, click a source.
 
 ## 9. Vercel frontend deployment
 
@@ -152,9 +181,11 @@ work because they come from stored coordinates, not embeddings.
 
 | Variable | Value |
 | --- | --- |
-| `VITE_API_BASE_URL` | `https://<your-render-service>/api` (the Render backend) |
+| `VITE_API_BASE_URL` | `https://<your-render-service>.onrender.com/api` |
 
-Everything the browser fetches/SSE-connects goes to that base. No other config.
+This is baked in at **build time**, so set it before building and redeploy after
+changing it. Everything the browser fetches/SSE-connects goes to that base. No
+other frontend config — nothing secret reaches the bundle.
 
 ## 11. CORS
 

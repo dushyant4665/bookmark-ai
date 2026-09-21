@@ -1,10 +1,34 @@
 import { useEffect, useRef, useState } from 'react';
 import { useWorkspace } from '../state/WorkspaceContext';
-import type { Edition } from '../types';
+import type { LibraryItem } from '../types';
 
 // Reflects the real backend ingestion_status only — never invented values.
-function statusText(e: Edition): string {
-  switch (e.ingestionStatus) {
+function statusText(item: LibraryItem): { label: string; tone: string } {
+  switch (item.ingestionStatus) {
+    case 'COMPLETED':
+      return { label: 'Ready', tone: 'text-accent-strong' };
+    case 'PROCESSING':
+    case 'PENDING':
+      return { label: 'Preparing', tone: 'text-ink-muted' };
+    case 'FAILED':
+      return { label: 'Needs attention', tone: 'text-red-600' };
+    case 'NOT_INGESTED':
+      return { label: 'Source only', tone: 'text-ink-muted' };
+    default:
+      // In the storage folder but never ingested: it cannot be read or asked
+      // about yet, and saying so is the honest label.
+      return item.bookId ? { label: 'Source only', tone: 'text-ink-muted' } : { label: 'Not indexed', tone: 'text-ink-muted' };
+  }
+}
+
+function sizeText(item: LibraryItem): string | null {
+  if (item.pageCount && item.chunkCount) return `${item.pageCount} pages · ${item.chunkCount} passages`;
+  if (item.file.size) return `${Math.round(item.file.size / 1024 / 1024)} MB`;
+  return null;
+}
+
+function editionStatus(status?: string | null): string {
+  switch (status) {
     case 'COMPLETED':
       return 'Ready';
     case 'PROCESSING':
@@ -13,16 +37,18 @@ function statusText(e: Edition): string {
     case 'FAILED':
       return 'Needs attention';
     default:
-      return e.hasSource ? 'Source only' : 'No source';
+      return '';
   }
 }
 
-// Loads books from the backend. The catalog is never hardcoded here.
+// The catalog is the user's own storage folder (books/ in the bucket, or the
+// managed local directory) — never a hardcoded list.
 export function BookSelector() {
   const {
-    books,
-    booksLoading,
-    booksError,
+    library,
+    libraryLoading,
+    libraryError,
+    librarySource,
     selectedBook,
     editions,
     editionsLoading,
@@ -43,9 +69,9 @@ export function BookSelector() {
 
   const label = selectedBook
     ? selectedBook.title
-    : booksLoading
+    : libraryLoading
       ? 'Loading books…'
-      : booksError
+      : libraryError
         ? 'Books unavailable'
         : 'Select a book';
 
@@ -64,7 +90,9 @@ export function BookSelector() {
             <span className="block truncate text-xs text-ink-muted">
               {selectedBook.author || 'Unknown author'}
               {editions.length > 1 && selectedEdition?.label ? ` · ${selectedEdition.label}` : ''}
-              {selectedEdition ? ` · ${statusText(selectedEdition)}` : ''}
+              {editionStatus(selectedEdition?.ingestionStatus)
+                ? ` · ${editionStatus(selectedEdition?.ingestionStatus)}`
+                : ''}
             </span>
           ) : null}
         </span>
@@ -78,50 +106,70 @@ export function BookSelector() {
           role="listbox"
           className="absolute z-30 mt-1 max-h-96 w-80 overflow-auto rounded-lg border border-line bg-surface p-1 shadow-lg bm-scroll"
         >
-          {booksLoading ? <li className="px-3 py-2 text-sm text-ink-muted">Loading…</li> : null}
-          {!booksLoading && booksError ? <li className="px-3 py-2 text-sm text-ink-muted">{booksError}</li> : null}
-          {!booksLoading && !booksError && books.length === 0 ? (
-            <li className="px-3 py-2 text-sm text-ink-muted">No books in the library yet.</li>
+          {libraryLoading ? <li className="px-3 py-2 text-sm text-ink-muted">Loading…</li> : null}
+          {!libraryLoading && libraryError ? <li className="px-3 py-2 text-xs text-ink-muted">{libraryError}</li> : null}
+          {!libraryLoading && !libraryError && library.length === 0 ? (
+            <li className="px-3 py-2 text-sm text-ink-muted">
+              No PDFs found{librarySource?.prefix ? ` in ${librarySource.prefix}` : ''}.
+            </li>
           ) : null}
 
-          {books.map((b) => (
-            <div key={b.id}>
-              <button
-                type="button"
-                role="option"
-                aria-selected={b.id === selectedBook?.id}
-                onClick={() => {
-                  selectBook(b.id);
-                  setOpen(false);
-                }}
-                className={`w-full rounded px-3 py-2 text-left text-sm hover:bg-surface-sunken ${
-                  b.id === selectedBook?.id ? 'bg-accent-soft' : ''
-                }`}
-              >
-                <span className="block font-medium text-ink">{b.title}</span>
-                <span className="block text-xs text-ink-muted">{b.author || 'Unknown author'}</span>
-              </button>
+          {library.map((item) => {
+            const status = statusText(item);
+            const disabled = !item.bookId || !item.editionId;
+            const selected = item.bookId && item.bookId === selectedBook?.id;
+            const meta = [item.author || 'Unknown author', sizeText(item)].filter(Boolean).join(' · ');
+            return (
+              <div key={item.key}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={Boolean(selected)}
+                  disabled={disabled}
+                  title={
+                    disabled
+                      ? 'This PDF is in the library folder but has not been indexed yet. Ingest it to make it searchable.'
+                      : undefined
+                  }
+                  onClick={() => {
+                    if (disabled || !item.bookId) return;
+                    selectBook(item.bookId, item.editionId);
+                    setOpen(false);
+                  }}
+                  className={`w-full rounded px-3 py-2 text-left text-sm ${
+                    disabled
+                      ? 'cursor-not-allowed opacity-60'
+                      : `hover:bg-surface-sunken ${selected ? 'bg-accent-soft' : ''}`
+                  }`}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate font-medium text-ink">{item.title}</span>
+                    <span className={`shrink-0 text-[11px] ${status.tone}`}>{status.label}</span>
+                  </span>
+                  <span className="block truncate text-xs text-ink-muted">{meta}</span>
+                </button>
 
-              {b.id === selectedBook?.id && !editionsLoading && editions.length > 1 ? (
-                <div className="mb-1 ml-3 flex flex-wrap gap-1">
-                  {editions.map((e) => (
-                    <button
-                      key={e.id}
-                      type="button"
-                      onClick={() => selectEdition(e.id)}
-                      className={`rounded border px-2 py-0.5 text-xs ${
-                        e.id === selectedEdition?.id
-                          ? 'border-accent bg-accent text-white'
-                          : 'border-line text-ink-muted hover:bg-surface-sunken'
-                      }`}
-                    >
-                      {e.label || 'Edition'}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ))}
+                {selected && !editionsLoading && editions.length > 1 ? (
+                  <div className="mb-1 ml-3 flex flex-wrap gap-1">
+                    {editions.map((e) => (
+                      <button
+                        key={e.id}
+                        type="button"
+                        onClick={() => selectEdition(e.id)}
+                        className={`rounded border px-2 py-0.5 text-xs ${
+                          e.id === selectedEdition?.id
+                            ? 'border-accent bg-accent text-white'
+                            : 'border-line text-ink-muted hover:bg-surface-sunken'
+                        }`}
+                      >
+                        {e.label || 'Edition'}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       ) : null}
     </div>

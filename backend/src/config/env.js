@@ -41,6 +41,9 @@ export const env = {
 
   storageBackend: process.env.STORAGE_BACKEND || 'local',
   storageLocalDir: process.env.STORAGE_LOCAL_DIR || './data/books',
+  // Where the user drops their own PDFs. The book dropdown lists this folder, so
+  // "put a PDF in books/" is all it takes to make a book available to index.
+  storageLibraryPrefix: process.env.STORAGE_LIBRARY_PREFIX || 'books/',
 
   // Ingestion / chunking configuration lives in one place (never scattered).
   ingest: {

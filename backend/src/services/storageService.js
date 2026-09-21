@@ -1,8 +1,8 @@
 import { createReadStream } from 'node:fs';
-import { stat, mkdir, copyFile, access } from 'node:fs/promises';
+import { stat, mkdir, copyFile, access, readdir } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { constants } from 'node:fs';
-import { resolve, sep, dirname } from 'node:path';
+import { resolve, sep, dirname, join } from 'node:path';
 import { env } from '../config/env.js';
 import { query } from '../db/pool.js';
 
@@ -35,6 +35,37 @@ class LocalStorageProvider {
   keyFor(bookSlug, editionLabel) {
     return [String(bookSlug), String(editionLabel), 'source.pdf'].join('/');
   }
+  // Every PDF under the managed directory, as relative POSIX keys.
+  async list() {
+    const base = resolve(env.storageLocalDir);
+    const out = [];
+    const walk = async (dir, rel) => {
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) await walk(join(dir, entry.name), childRel);
+        else if (entry.isFile() && /\.pdf$/i.test(entry.name)) {
+          const info = await stat(join(dir, entry.name)).catch(() => null);
+          out.push({
+            key: childRel,
+            name: entry.name,
+            size: info ? Number(info.size) : null,
+            lastModified: info ? info.mtime.toISOString() : null,
+          });
+        }
+      }
+    };
+    await walk(base, '');
+    return out;
+  }
+  async absPath(storageKey) {
+    return safeJoin(storageKey);
+  }
   async exists(storageKey) {
     try {
       await access(safeJoin(storageKey), constants.R_OK);
@@ -59,6 +90,12 @@ class LocalStorageProvider {
       };
     }
     return { stream: createReadStream(path), fileSize, contentLength: fileSize, acceptRanges: 'bytes' };
+  }
+  // The Supabase provider has this; the range path in getBookPdf needs it from
+  // both, or a local byte-range request silently re-sends the whole PDF.
+  async info(storageKey) {
+    const info = await stat(safeJoin(storageKey));
+    return { byteSize: Number(info.size) };
   }
   // Copies an already-uploaded file into the managed store and returns metadata.
   async put(storageKey, sourceFilePath) {
@@ -134,6 +171,42 @@ class SupabaseStorageProvider {
     const res = await fetch(this.objectUrl(storageKey), { method: 'HEAD', headers: this.authHeaders() });
     return res.ok;
   }
+  // Real folder listing. Supabase's list endpoint is per-directory, so folders
+  // are walked a bounded depth below the prefix — the user's library is whatever
+  // PDFs live under it, not a hardcoded catalogue.
+  async list(prefix = '', { depth = 3, limit = 200 } = {}) {
+    const out = [];
+    const walk = async (rel, level) => {
+      if (level > depth || out.length >= limit) return;
+      const res = await fetch(`${this.base}/storage/v1/object/list/${this.bucket}`, {
+        method: 'POST',
+        headers: { ...this.authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify({ prefix: rel, limit, offset: 0, sortBy: { column: 'name', order: 'asc' } }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        const e = new Error(`STORAGE_LIST_${res.status}`);
+        e.detail = detail.slice(0, 200);
+        throw e;
+      }
+      for (const item of await res.json()) {
+        const name = String(item.name ?? '');
+        const key = rel ? `${rel}${name}` : name;
+        if (!name) continue;
+        if (item.id == null) await walk(`${key}/`, level + 1); // a folder, not an object
+        else if (/\.pdf$/i.test(name)) {
+          out.push({
+            key,
+            name,
+            size: item.metadata?.size != null ? Number(item.metadata.size) : null,
+            lastModified: item.updated_at ?? item.metadata?.lastModified ?? null,
+          });
+        }
+      }
+    };
+    await walk(prefix, 1);
+    return out;
+  }
   async info(storageKey) {
     const res = await fetch(this.objectUrl(storageKey), { method: 'HEAD', headers: this.authHeaders() });
     if (!res.ok) throw new Error('STORAGE_OBJECT_NOT_FOUND');
@@ -186,20 +259,64 @@ export function makeStorageProvider(backend = env.storageBackend) {
   throw new Error('STORAGE_BACKEND_UNSUPPORTED');
 }
 
+// The library the book dropdown lists. The user's own PDFs live in the Supabase
+// bucket, so when that bucket is configured it wins even in a local-storage dev
+// setup; otherwise the managed local directory is listed. Reports which source
+// it read and any real error — an empty list is never presented as a full one.
+export async function libraryListing() {
+  const prefix = env.storageLibraryPrefix;
+  const supabaseConfigured = Boolean(env.supabaseUrl && env.supabaseServiceRoleKey && env.supabaseStorageBucket);
+  if (!supabaseConfigured) {
+    const files = await new LocalStorageProvider().list();
+    return { backend: 'local', bucket: null, prefix: null, files, error: null };
+  }
+  try {
+    const provider = new SupabaseStorageProvider();
+    const files = await provider.list(prefix.endsWith('/') ? prefix : `${prefix}/`);
+    return { backend: 'supabase', bucket: provider.bucket, prefix, files, error: null };
+  } catch (err) {
+    return {
+      backend: 'supabase',
+      bucket: env.supabaseStorageBucket,
+      prefix,
+      files: [],
+      error: String(err?.message || err).slice(0, 200),
+    };
+  }
+}
+
 // Resolves the exact source row for an edition and returns a readable stream.
 // Accepts an optional raw Range header so PDF.js byte-range requests pass
 // straight through to the provider (no full-file download per render).
 export async function getBookPdf(bookId, editionId, { rangeHeader } = {}) {
   const { rows } = await query(
-    `SELECT bs.id, bs.storage_backend, bs.storage_key, bs.mime_type, bs.original_filename, bs.sha256
+    `SELECT bs.id, bs.storage_backend, bs.storage_key, bs.mime_type, bs.original_filename,
+            bs.sha256, bs.byte_size
        FROM book_sources bs
        JOIN book_editions be ON be.id = bs.edition_id
       WHERE bs.edition_id = $1 AND be.book_id = $2
       LIMIT 1`,
     [editionId, bookId]
   );
-  const rec = rows[0];
+  let rec = rows[0];
   if (!rec) return null;
+
+  // A source row records where the PDF lived at ingest time. Files move — the
+  // bucket gets reorganised from the dashboard, a dev-only local path never
+  // reaches production — and a stale key used to surface as "The PDF failed to
+  // load". So a missing object is re-found by CONTENT, never by name: the
+  // candidate's real SHA-256 has to equal the one we computed at ingest, and
+  // only then is the row repointed.
+  const initial = makeStorageProvider(rec.storage_backend);
+  if (!(await initial.exists(rec.storage_key).catch(() => false))) {
+    const found = await relocateMissingSource(rec);
+    if (!found) return null;
+    await query(
+      `UPDATE book_sources SET storage_backend = $2, storage_key = $3, updated_at = now() WHERE id = $1`,
+      [rec.id, found.storageBackend, found.storageKey]
+    );
+    rec = { ...rec, storage_backend: found.storageBackend, storage_key: found.storageKey };
+  }
 
   const provider = makeStorageProvider(rec.storage_backend);
   // Only probe size for a full (non-range) request so a range request doesn't
@@ -221,6 +338,55 @@ export async function getBookPdf(bookId, editionId, { rangeHeader } = {}) {
     originalFilename: rec.original_filename || 'book.pdf',
     sha256: rec.sha256,
   };
+}
+
+// Every PDF the app can see, most portable first: the shared bucket, then this
+// machine's local store. A production box has no local dir, and a dev box may
+// have no bucket credentials — either list alone would be incomplete.
+async function candidateFiles() {
+  const out = [];
+  const supabaseConfigured = Boolean(env.supabaseUrl && env.supabaseServiceRoleKey && env.supabaseStorageBucket);
+  if (supabaseConfigured) {
+    try {
+      const provider = new SupabaseStorageProvider();
+      const prefix = env.storageLibraryPrefix;
+      for (const f of await provider.list(prefix.endsWith('/') ? prefix : `${prefix}/`)) {
+        out.push({ storageBackend: 'supabase', storageKey: f.key, byteSize: f.size });
+      }
+    } catch {
+      // An unreachable bucket is not a reason to fail a lookup that local may answer.
+    }
+  }
+  for (const f of await new LocalStorageProvider().list()) {
+    out.push({ storageBackend: 'local', storageKey: f.key, byteSize: f.size });
+  }
+  return out;
+}
+
+export async function sha256StoredFile(storageBackend, storageKey) {
+  const { createHash } = await import('node:crypto');
+  const opened = await makeStorageProvider(storageBackend).open(storageKey);
+  const hash = createHash('sha256');
+  for await (const chunk of opened.stream) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+// Returns the verified new location, or null when no file's bytes match. Never
+// guesses from a filename: a wrong PDF would silently break every citation.
+// `candidates`/`hashOf` are injectable so tests can drive this without a bucket.
+export async function relocateMissingSource(source, { candidates = candidateFiles, hashOf = sha256StoredFile } = {}) {
+  if (!source?.sha256) return null;
+  for (const file of await candidates()) {
+    if (file.storageKey === source.storage_key && file.storageBackend === source.storage_backend) continue;
+    // Size is a cheap filter so we hash at most a couple of real candidates.
+    if (source.byte_size != null && file.byteSize != null && String(file.byteSize) !== String(source.byte_size)) continue;
+    try {
+      if ((await hashOf(file.storageBackend, file.storageKey)) === source.sha256) return file;
+    } catch {
+      // Unreadable candidate: keep looking, do not fail the request on it.
+    }
+  }
+  return null;
 }
 
 // §7 source/PDF integrity: recompute the stored object's SHA-256 and compare it

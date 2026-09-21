@@ -2,17 +2,22 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { ReactNode } from 'react';
 import { api } from '../lib/api';
 import { useAuth } from './AuthContext';
-import type { Book, Edition } from '../types';
+import type { Book, Edition, LibraryItem } from '../types';
 
 interface WorkspaceState {
+  // The library folder in storage, joined to real ingestion state. This is what
+  // the book selector shows — a PDF the user drops into the bucket appears here
+  // without any code change.
+  library: LibraryItem[];
+  libraryLoading: boolean;
+  libraryError: string | null;
+  librarySource: { backend: string; bucket: string | null; prefix: string | null } | null;
   books: Book[];
-  booksLoading: boolean;
-  booksError: string | null;
   selectedBook: Book | null;
   editions: Edition[];
   editionsLoading: boolean;
   selectedEdition: Edition | null;
-  selectBook: (bookId: string) => void;
+  selectBook: (bookId: string, preferredEditionId?: string | null) => void;
   selectEdition: (editionId: string) => void;
 }
 
@@ -38,14 +43,29 @@ function readStored(userId: string | undefined): Stored | null {
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
-  const [books, setBooks] = useState<Book[]>([]);
-  const [booksLoading, setBooksLoading] = useState(true);
-  const [booksError, setBooksError] = useState<string | null>(null);
+  const [library, setLibrary] = useState<LibraryItem[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(true);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [librarySource, setLibrarySource] = useState<WorkspaceState['librarySource']>(null);
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null);
 
   const [editions, setEditions] = useState<Edition[]>([]);
   const [editionsLoading, setEditionsLoading] = useState(false);
   const [selectedEditionId, setSelectedEditionId] = useState<string | null>(null);
+
+  // The dropdown is keyed by storage file, but the rest of the app (chat,
+  // reader, conversations) speaks book ids. Derive the book list from the
+  // library so both views can never disagree about what exists.
+  const books = useMemo<Book[]>(() => {
+    const seen = new Map<string, Book>();
+    for (const item of library) {
+      if (!item.bookId) continue;
+      if (!seen.has(item.bookId)) {
+        seen.set(item.bookId, { id: item.bookId, title: item.title, author: item.author, description: null });
+      }
+    }
+    return Array.from(seen.values());
+  }, [library]);
 
   const remember = useCallback(
     (patch: Partial<Stored>) => {
@@ -77,28 +97,36 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Load the catalog once, when the workspace becomes available.
+  // Load the library once, when the workspace becomes available.
   useEffect(() => {
     let active = true;
-    setBooksLoading(true);
+    setLibraryLoading(true);
     api
-      .books()
-      .then(async (list) => {
+      .library()
+      .then(async (data) => {
         if (!active) return;
-        setBooks(list);
-        setBooksError(null);
+        setLibrary(data.items);
+        setLibrarySource(data.storage);
+        setLibraryError(
+          data.storage.listingError
+            ? `The storage folder could not be listed (${data.storage.listingError}).${data.databaseError ? ' Database: ' + data.databaseError : ''}`
+            : data.databaseError
+              ? `Ingestion state is unavailable (${data.databaseError}).`
+              : null
+        );
+        const ids = new Set(data.items.map((i) => i.bookId).filter(Boolean));
         const stored = readStored(user?.id);
-        if (stored && list.some((b) => b.id === stored.bookId)) {
+        if (stored && ids.has(stored.bookId)) {
           setSelectedBookId(stored.bookId);
           await loadEditions(stored.bookId, stored.editionId);
         }
       })
       .catch((err) => {
         if (!active) return;
-        setBooks([]);
-        setBooksError(err?.message || 'BOOKS_FAILED');
+        setLibrary([]);
+        setLibraryError(err?.message || 'LIBRARY_FAILED');
       })
-      .finally(() => active && setBooksLoading(false));
+      .finally(() => active && setLibraryLoading(false));
     return () => {
       active = false;
     };
@@ -106,10 +134,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, [user?.id, loadEditions]);
 
   const selectBook = useCallback(
-    (bookId: string) => {
+    (bookId: string, preferredEditionId?: string | null) => {
       setSelectedBookId(bookId);
-      remember({ bookId, editionId: null });
-      void loadEditions(bookId);
+      remember({ bookId, editionId: preferredEditionId ?? null });
+      void loadEditions(bookId, preferredEditionId);
     },
     [loadEditions, remember]
   );
@@ -124,9 +152,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<WorkspaceState>(
     () => ({
+      library,
+      libraryLoading,
+      libraryError,
+      librarySource,
       books,
-      booksLoading,
-      booksError,
       selectedBook: books.find((b) => b.id === selectedBookId) ?? null,
       editions,
       editionsLoading,
@@ -134,7 +164,19 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       selectBook,
       selectEdition,
     }),
-    [books, booksLoading, booksError, selectedBookId, editions, editionsLoading, selectedEditionId, selectBook, selectEdition]
+    [
+      library,
+      libraryLoading,
+      libraryError,
+      librarySource,
+      books,
+      selectedBookId,
+      editions,
+      editionsLoading,
+      selectedEditionId,
+      selectBook,
+      selectEdition,
+    ]
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

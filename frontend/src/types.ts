@@ -23,6 +23,41 @@ export interface Edition {
   ingestionStatus: 'NOT_INGESTED' | 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
 }
 
+// One entry of the real storage library (the bucket folder the user keeps their
+// PDFs in), joined by the backend to what has actually been indexed. `indexed`
+// is the honest gate: a file the user just dropped in is visible but cannot be
+// asked about or opened until it has been ingested.
+export interface LibraryFile {
+  backend: string;
+  key: string;
+  name: string | null;
+  size: number | null;
+  lastModified: string | null;
+  inLibrary: boolean;
+}
+
+export interface LibraryItem {
+  key: string;
+  title: string;
+  author: string | null;
+  indexed: boolean;
+  ingestionStatus: string | null;
+  bookId: string | null;
+  editionId: string | null;
+  editionLabel: string | null;
+  pageCount: number | null;
+  chunkCount: number | null;
+  embeddingDim: number | null;
+  file: LibraryFile;
+}
+
+export interface Library {
+  storage: { backend: string; bucket: string | null; prefix: string | null; listingError: string | null };
+  databaseError: string | null;
+  files: number;
+  items: LibraryItem[];
+}
+
 // A real PDF user-space rectangle for one source text run (Phase 4 highlight).
 // x/y are the text baseline origin, width/height the run's box — straight from
 // the page's stored text items. The viewer converts these to DOM pixels with

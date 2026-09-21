@@ -1,4 +1,4 @@
-import type { Book, ChatMessage, Conversation, Edition, Evidence, SourceRect, User } from '../types';
+import type { Book, ChatMessage, Conversation, Edition, Library, LibraryItem, Evidence, SourceRect, User } from '../types';
 
 const BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 const TOKEN_KEY = 'bookmark.token';
@@ -61,6 +61,30 @@ const mapConversation = (c: any): Conversation => ({
   updatedAt: c.updated_at,
 });
 
+// The library endpoint already answers in camelCase (it is assembled here, not a
+// raw table dump), so this only guards against missing fields.
+const mapLibraryItem = (i: any): LibraryItem => ({
+  key: String(i.key ?? i.file?.key ?? ''),
+  title: i.title ?? 'Untitled',
+  author: i.author ?? null,
+  indexed: Boolean(i.indexed),
+  ingestionStatus: i.ingestionStatus ?? null,
+  bookId: i.bookId ?? null,
+  editionId: i.editionId ?? null,
+  editionLabel: i.editionLabel ?? null,
+  pageCount: i.pageCount ?? null,
+  chunkCount: i.chunkCount ?? null,
+  embeddingDim: i.embeddingDim ?? null,
+  file: {
+    backend: i.file?.backend ?? '',
+    key: i.file?.key ?? '',
+    name: i.file?.name ?? null,
+    size: i.file?.size ?? null,
+    lastModified: i.file?.lastModified ?? null,
+    inLibrary: Boolean(i.file?.inLibrary),
+  },
+});
+
 // A backend citation is already resolved to real DB rows. Map only structured
 // fields the UI renders — the UI never parses pages or text from prose. Rects
 // are real PDF user-space boxes (from the page's stored text items) used for
@@ -111,6 +135,23 @@ export const api = {
   editions: async (bookId: string) => {
     const data = await request<{ editions: any[] }>(`/books/${bookId}/editions`);
     return data.editions.map(mapEdition);
+  },
+  // The storage library folder plus real ingestion state — the selector's source.
+  library: async (): Promise<Library> => {
+    const data = await request<any>('/books/library');
+    const items: LibraryItem[] = (data.items ?? []).map(mapLibraryItem);
+    return {
+      storage: {
+        backend: data.storage?.backend ?? 'local',
+        bucket: data.storage?.bucket ?? null,
+        prefix: data.storage?.prefix ?? null,
+        listingError: data.storage?.listingError ?? null,
+      },
+      databaseError: data.databaseError ?? null,
+      files: Number(data.files ?? 0),
+      // The backend sorts by title; keeping that order makes the list stable.
+      items,
+    };
   },
   pdfUrl: (bookId: string, editionId: string) => `${BASE}/books/${bookId}/editions/${editionId}/pdf`,
 

@@ -12,6 +12,16 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// The library folder in storage is what the selector shows, joined against real
+// ingestion state. Declared before /:bookId so "library" is never read as an id.
+router.get('/library', async (req, res, next) => {
+  try {
+    res.json(await bookService.listLibrary());
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/:bookId', async (req, res, next) => {
   try {
     const book = await bookService.getBook(req.params.bookId);

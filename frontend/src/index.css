@@ -56,8 +56,32 @@ body {
   animation: bm-rise 0.22s ease-out both;
 }
 
+/* The typing caret that follows the last revealed character. */
+@keyframes bm-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  55%,
+  100% {
+    opacity: 0;
+  }
+}
+.bm-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: currentColor;
+  animation: bm-blink 1s steps(1, end) infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .bm-rise {
+    animation: none;
+  }
+  .bm-caret {
     animation: none;
   }
 }

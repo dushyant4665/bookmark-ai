@@ -22,6 +22,14 @@ const SUGGESTIONS = [
   'What does the author concede or reject?',
 ];
 
+// Groq writes far faster than anyone can read, so raw SSE deltas are queued and
+// revealed at a steady typing pace. While the model is still talking we type at
+// reading speed; once its stream has ended the remainder drains quickly instead
+// of leaving the UI typing at nothing.
+const TYPE_CHARS_PER_SEC = 105;
+const TYPE_TAIL_CHARS_PER_SEC = 340;
+const TYPE_TICK_MS = 16;
+
 export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => void }) {
   const { selectedBook, selectedEdition, editions } = useWorkspace();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -35,12 +43,73 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
   // Each book/edition selection owns a turn number. A slow response from an
   // earlier selection must never overwrite the conversation now on screen.
   const turnRef = useRef(0);
+  const typeRef = useRef({ id: '', queue: '', streamOpen: false, timer: 0, last: 0, onDrained: null as null | (() => void) });
+
+  const appendNow = useCallback((id: string, piece: string) => {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, content: m.content + piece } : m)));
+  }, []);
+
+  const stopTyping = useCallback(() => {
+    const t = typeRef.current;
+    if (t.timer) window.clearInterval(t.timer);
+    t.timer = 0;
+    t.onDrained = null;
+  }, []);
+
+  // Text the model already produced is never thrown away — on Stop or an error
+  // the undisplayed remainder is flushed in full before the message closes.
+  const flushTyping = useCallback(() => {
+    const t = typeRef.current;
+    if (t.queue) appendNow(t.id, t.queue);
+    t.queue = '';
+    stopTyping();
+  }, [appendNow, stopTyping]);
+
+  const startTyping = useCallback(() => {
+    const t = typeRef.current;
+    if (t.timer) return;
+    t.last = Date.now();
+    t.timer = window.setInterval(() => {
+      const elapsed = Date.now() - t.last;
+      t.last = Date.now();
+      if (!t.queue) {
+        if (!t.streamOpen) {
+          const done = t.onDrained;
+          stopTyping();
+          done?.();
+        }
+        return;
+      }
+      const rate = t.streamOpen ? TYPE_CHARS_PER_SEC : TYPE_TAIL_CHARS_PER_SEC;
+      const want = Math.min(t.queue.length, Math.max(1, Math.round((rate * elapsed) / 1000)));
+      // Break on a space where possible so words are typed, not chopped.
+      const head = t.queue.slice(0, want);
+      const space = head.lastIndexOf(' ');
+      const cut = space > want * 0.5 ? space + 1 : want;
+      const piece = t.queue.slice(0, cut);
+      t.queue = t.queue.slice(cut);
+      appendNow(t.id, piece);
+    }, TYPE_TICK_MS);
+  }, [appendNow, stopTyping]);
+
+  useEffect(() => () => stopTyping(), [stopTyping]);
 
   // Restore the last conversation for this book/edition instead of starting
   // blank — the chat survives a page refresh.
+  // Leaving a conversation mid-stream: drop the undisplayed remainder (the full
+  // answer is already stored server-side and reloads from history).
+  const resetTyping = useCallback(() => {
+    const t = typeRef.current;
+    t.queue = '';
+    t.streamOpen = false;
+    t.id = '';
+    stopTyping();
+  }, [stopTyping]);
+
   useEffect(() => {
     const turn = ++turnRef.current;
     abortRef.current?.abort();
+    resetTyping();
     setMessages([]);
     setConversationId(null);
     setActivity(null);
@@ -76,12 +145,13 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
   const startNewChat = useCallback(() => {
     abortRef.current?.abort();
     turnRef.current += 1;
+    resetTyping();
     setMessages([]);
     setConversationId(null);
     setActivity(null);
     setBusy(false);
     setRestoring(false);
-  }, []);
+  }, [resetTyping]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -95,10 +165,17 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
   }, []);
 
   const appendDelta = useCallback((id: string, delta: string) => {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === id ? { ...m, content: m.content + delta } : m))
-    );
-  }, []);
+    const t = typeRef.current;
+    if (t.id && t.id !== id) {
+      // A different answer took over: whatever the model already wrote is kept.
+      if (t.queue) appendNow(t.id, t.queue);
+      t.queue = '';
+    }
+    t.id = id;
+    t.queue += delta;
+    t.streamOpen = true;
+    startTyping();
+  }, [appendNow, startTyping]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -135,11 +212,27 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
     // §17: distinguish a clean finish from a dropped stream. If neither a
     // `complete` nor an `error` arrived, the answer is truncated — not done.
     let sawTerminal = false;
+    // The citations land while the answer is still being typed out. They are
+    // shown when the message closes, not in its middle.
+    let sources: Evidence[] = [];
 
-    const finish = (opts: Partial<ChatMessage> = {}) => {
+    const close = (opts: Partial<ChatMessage> = {}) => {
       setBusy(false);
       setActivity(null);
-      patchAssistant(assistantId, { streaming: false, ...opts });
+      patchAssistant(assistantId, { streaming: false, evidence: sources, ...opts });
+    };
+
+    // A stream that ends while text is still queued keeps the message open
+    // until the typed remainder reaches the screen.
+    const finish = (opts: Partial<ChatMessage> = {}) => {
+      const t = typeRef.current;
+      t.streamOpen = false;
+      if (!t.queue) {
+        close(opts);
+        return;
+      }
+      t.onDrained = () => close(opts);
+      startTyping();
     };
 
     await streamChat(
@@ -187,7 +280,7 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
               break;
             }
             case 'sources_ready':
-              patchAssistant(assistantId, { evidence: readSources(data) });
+              sources = readSources(data);
               break;
             case 'validation_complete':
               setActivity(null);
@@ -198,11 +291,8 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
               break;
             case 'error':
               sawTerminal = true;
-              patchAssistant(assistantId, {
-                error: data.message || 'The research backend is being prepared.',
-                streaming: false,
-              });
-              finish();
+              flushTyping();
+              finish({ error: data.message || 'The research backend is being prepared.' });
               break;
             default:
               break;
@@ -211,27 +301,26 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
         onError: () => {
           // A user-initiated Stop is an AbortError handled in the client; any
           // other end is a real failure. Never pretend generation completed.
-          patchAssistant(assistantId, { error: 'Chat failed or was interrupted. Please try again.', streaming: false });
-          finish();
+          flushTyping();
+          finish({ error: 'Chat failed or was interrupted. Please try again.' });
         },
         onClose: () => {
           // Stream ended. A user Stop is honest ("Stopped."). An unexpected
           // close with no terminal event means the answer was truncated — say
           // so; never present a partial stream as a completed answer (§17).
+          flushTyping();
           if (controller.signal.aborted) {
-            patchAssistant(assistantId, { error: 'Stopped.', streaming: false });
+            finish({ error: 'Stopped.' });
           } else if (!sawTerminal) {
-            patchAssistant(assistantId, {
-              error: 'The connection ended before the answer finished. Please try again.',
-              streaming: false,
-            });
+            finish({ error: 'The connection ended before the answer finished. Please try again.' });
+          } else {
+            finish();
           }
-          finish();
         },
       },
       controller.signal
     );
-  }, [input, busy, selectedBook, selectedEdition, conversationId, patchAssistant, appendDelta]);
+  }, [input, busy, selectedBook, selectedEdition, conversationId, patchAssistant, appendDelta, startTyping, flushTyping]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {

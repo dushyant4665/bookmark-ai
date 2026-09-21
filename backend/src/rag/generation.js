@@ -32,6 +32,22 @@ function formRule(formNote) {
   return `The user's latest message asked for a change of form rather than new content: ${formNote}. Honour that request while staying inside the supplied evidence.`;
 }
 
+// The answer is read in a chat column, so it has to LOOK like an answer: a
+// direct first line, then structure only where the content has several parts.
+// The UI renders paragraphs and "- " bullets and the citation list is attached
+// by the backend, so neither markdown noise nor evidence ids belong in prose.
+function answerFormatRule() {
+  return [
+    'Write it the way a good answer reads on screen:',
+    '- Open with one or two sentences that answer the question directly.',
+    '- When there are several distinct points, list them as short "- " lines, one point each; otherwise stay in plain prose.',
+    '- Put a blank line between paragraphs. Use **bold** only for a name or term worth anchoring on. No headings, no tables, no code fences.',
+    '- Do not open with filler ("Certainly", "Great question") and do not restate the question.',
+    '- Keep it tight — around 150 words unless the question or the evidence genuinely needs more.',
+    '- Never write evidence ids (such as [e1] or (e2, e3)) in the answer text; the cited passages are attached below the answer automatically.',
+  ].join('\n');
+}
+
 // Replies that carry no evidence — a conversational turn, or a search that
 // matched nothing — must not talk about an EVIDENCE block the model never got.
 export function plainLanguageRule(answerLanguage = 'en') {
@@ -138,6 +154,9 @@ export function buildSystemPrompt({ answerLanguage = 'en', formNote = null } = {
     '  "confidence": "supported" | "partially_supported" | "insufficient"',
     '}',
     '',
+    'Write the "answer" string in this shape:',
+    answerFormatRule(),
+    '',
     'evidenceIds MUST be a subset of the ids supplied in the EVIDENCE block. Never cite an id you were not given. Never put a page number or quotation in "answer" unless that exact text is inside the supplied evidence.',
   ].join('\n');
 }
@@ -223,7 +242,8 @@ function streamingSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) 
     ...(formNote ? [`- ${formRule(formNote)}`] : []),
     '',
     'Output format — follow EXACTLY:',
-    `1. Write the answer as plain text (no JSON, no markdown fences).`,
+    `1. Write the answer (no JSON, no code fences) in this shape:`,
+    answerFormatRule(),
     `2. Then a line containing only the delimiter: ${CITATION_DELIM}`,
     `3. Then a single JSON object, nothing after it:`,
     `   {"evidenceIds": ["e1","e2"], "confidence": "supported" | "partially_supported" | "insufficient"}`,

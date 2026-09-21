@@ -12,10 +12,38 @@ import { completeChat, streamChatContent } from '../services/groqService.js';
 export const INSUFFICIENT_MESSAGE =
   "I don't have enough evidence in the indexed text to answer that reliably.";
 
+// The user gets an answer in the language they asked in — this is not a
+// translation layer, it is simply not ignoring the register they typed in.
+// Quoted evidence is never rewritten: a quotation must match the DB text.
+export function languageRule(answerLanguage = 'en') {
+  if (answerLanguage === 'hi') {
+    return 'The user wrote in Hindi. Write your answer in Hindi using Devanagari script. Keep character names readable (they may stay in their usual transliteration) and never translate a quoted passage — quote it exactly as the EVIDENCE block has it.';
+  }
+  if (answerLanguage === 'hinglish') {
+    return 'The user wrote in Hinglish (Hindi typed in Roman letters, casual tone). Reply in the same casual Hinglish register, in Roman script, the way a friend would explain it. Never translate a quoted passage — quote it exactly as the EVIDENCE block has it.';
+  }
+  return 'Reply in the language the user wrote in: an English question gets an English answer, and a Roman-script Hinglish question stays in Roman script — do not switch language or script on your own. Never translate a quoted passage — quote it exactly as the EVIDENCE block has it.';
+}
+
+// A short instruction about the FORM the user asked for ("say it again in
+// Hindi", "give an example"). It never changes what is claimed — only how.
+function formRule(formNote) {
+  if (!formNote) return null;
+  return `The user's latest message asked for a change of form rather than new content: ${formNote}. Honour that request while staying inside the supplied evidence.`;
+}
+
+// Replies that carry no evidence — a conversational turn, or a search that
+// matched nothing — must not talk about an EVIDENCE block the model never got.
+export function plainLanguageRule(answerLanguage = 'en') {
+  if (answerLanguage === 'hi') return 'Write your reply in Hindi using Devanagari script.';
+  if (answerLanguage === 'hinglish') return 'Write your reply in casual Hinglish (Hindi written in Roman letters), the way a friend talks.';
+  return 'Write your reply in English, in the same script the user typed in — a Roman-script "hi bhai" gets a Roman-script answer, not Devanagari.';
+}
+
 // A short, honest note written *about the search*, never about the book. This is
 // what the user sees when nothing matched, instead of one fixed string repeated
 // for every question. It carries no evidence, so it cannot invent a fact.
-export function buildNoEvidenceMessages({ question, bookContext = null, searchedTerms = [] }) {
+export function buildNoEvidenceMessages({ question, bookContext = null, searchedTerms = [], answerLanguage = 'en' }) {
   const book = bookContext?.title ? `"${bookContext.title}"` : 'this book';
   const terms = searchedTerms.filter(Boolean).slice(0, 6);
   return [
@@ -33,6 +61,8 @@ export function buildNoEvidenceMessages({ question, bookContext = null, searched
         '- Do not state, hint at, or guess any fact, event, character, argument, quotation, chapter or page from the book.',
         '- Do not say what the book "does" cover beyond what is listed as searched terms.',
         '- No JSON, no markdown, no bullet lists, no apology loops, and never begin with "As an AI".',
+        '',
+        plainLanguageRule(answerLanguage),
       ].join('\n'),
     },
     {
@@ -61,12 +91,13 @@ export async function generateNoEvidenceNote({
   question,
   bookContext = null,
   searchedTerms = [],
+  answerLanguage = 'en',
   groq = completeChat,
 }) {
   try {
     // json:false — this reply is plain prose about the search, not structured
     // output. Groq's json_object mode would otherwise reject it.
-    const raw = await groq(buildNoEvidenceMessages({ question, bookContext, searchedTerms }), { json: false, temperature: 0.5 });
+    const raw = await groq(buildNoEvidenceMessages({ question, bookContext, searchedTerms, answerLanguage }), { json: false, temperature: 0.5 });
     const text = typeof raw === 'string' ? raw.trim() : '';
     // Guard the honesty contract: an empty or absurdly long reply is not worth
     // risking, and the model must not smuggle in an evidence-style answer.
@@ -81,7 +112,7 @@ export async function generateNoEvidenceNote({
 const ALLOWED_CONFIDENCE = new Set(['supported', 'partially_supported', 'insufficient']);
 
 // §17 — the grounding contract. Strong, explicit, and small.
-export function buildSystemPrompt() {
+export function buildSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
@@ -95,6 +126,10 @@ export function buildSystemPrompt() {
     '- Do not manufacture certainty.',
     '',
     'Conversation history, when present, is provided ONLY to resolve references (for example, who "he" refers to). It is NOT evidence and never overrides the book.',
+    '',
+    'Language and form:',
+    `- ${languageRule(answerLanguage)}`,
+    ...(formNote ? [`- ${formRule(formNote)}`] : []),
     '',
     'Return STRICT JSON only, exactly this shape and nothing else:',
     '{',
@@ -142,7 +177,7 @@ function buildContextBlock(contextMessages = [], limit = ragConfig.contextMessag
 
 // §16/§17 — the full message array. Groq receives the question, minimal
 // conversation context, the book/edition identity, and ONLY the final evidence.
-export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null }) {
+export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -153,7 +188,7 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: buildSystemPrompt() },
+    { role: 'system', content: buildSystemPrompt({ answerLanguage, formNote }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -169,7 +204,7 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
 // citation truth: the ids are membership-checked and resolved to real DB rows.
 export const CITATION_DELIM = '###EVIDENCE###';
 
-function streamingSystemPrompt() {
+function streamingSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
@@ -183,6 +218,10 @@ function streamingSystemPrompt() {
     '',
     'Conversation history, when present, is provided ONLY to resolve references. It is NOT evidence and never overrides the book.',
     '',
+    'Language and form:',
+    `- ${languageRule(answerLanguage)}`,
+    ...(formNote ? [`- ${formRule(formNote)}`] : []),
+    '',
     'Output format — follow EXACTLY:',
     `1. Write the answer as plain text (no JSON, no markdown fences).`,
     `2. Then a line containing only the delimiter: ${CITATION_DELIM}`,
@@ -193,7 +232,7 @@ function streamingSystemPrompt() {
   ].join('\n');
 }
 
-export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null }) {
+export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -204,7 +243,7 @@ export function buildStreamingMessages({ question, evidence = [], contextMessage
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: streamingSystemPrompt() },
+    { role: 'system', content: streamingSystemPrompt({ answerLanguage, formNote }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -260,11 +299,13 @@ export async function generateAnswerStreaming({
   evidence = [],
   contextMessages = [],
   bookContext = null,
+  answerLanguage = 'en',
+  formNote = null,
   stream = streamChatContent,
   onDelta = null,
   signal = null,
 }) {
-  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext });
+  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote });
   const splitter = createAnswerSplitter();
   let answer = '';
   for await (const chunk of stream(messages, { signal })) {
@@ -364,9 +405,11 @@ export async function generateAnswer({
   evidence = [],
   contextMessages = [],
   bookContext = null,
+  answerLanguage = 'en',
+  formNote = null,
   groq = completeChat,
 }) {
-  const messages = buildMessages({ question, evidence, contextMessages, bookContext });
+  const messages = buildMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote });
   const raw = await groq(messages);
   const parsed = parseStructuredAnswer(raw);
   if (!parsed) throw new Error('ANSWER_PARSE_FAILED');

@@ -13,8 +13,8 @@ import {
   decideSufficiency,
   generateNoEvidenceNote,
   noEvidenceFallback,
-} from '../rag/generation.js';
-import { groqConfigured, completeChat, streamChatContent } from '../services/groqService.js';
+  plainLanguageRule,
+} from '../rag/generation.js';import { groqConfigured, completeChat, streamChatContent } from '../services/groqService.js';
 import { ragConfig } from '../config/rag.js';
 
 // ResearchService (Phase 3) — the reusable brain.
@@ -91,6 +91,127 @@ async function persistExchange(runQuery, { conversationId, userText, answerText,
   await runQuery(`UPDATE conversations SET updated_at = now() WHERE id = $1`, [conversationId]);
 }
 
+// ---------------------------------------------------------------------------
+// Conversational turns
+//
+// "chal bhai thik hindi me bta", "ok", "aage badhao" ask for a different FORM of
+// the previous answer, not for new content — so there is nothing in them to
+// search for. Running full-text retrieval on them used to produce "I could not
+// find the words chal, bhai, thik". Instead: re-serve the last real book
+// question in the requested language/form, and if there is no earlier question
+// to act on, reply as a conversation would (with no claims about the book).
+
+// Names used to tell the model which language the user asked to be answered in.
+const LANGUAGE_NAMES = { hi: 'Hindi', hinglish: 'Hinglish', en: 'English' };
+
+// Order matters: the most specific request wins.
+const FORM_HINTS = [
+  [/\b(dobara|dubara|again|phir|fir|repeat|rephrase)\b/i, 'say it again'],
+  [/\b(aage|age|jaari|zari|continue|next)\b/i, 'continue from where the previous answer stopped'],
+  [/\b(detail|zyada|jyada|bahut|poora|pura|elaborate|expand)\b/i, 'go into more detail'],
+  [/\b(?:example|udahar)\w*/i, 'add a concrete example'],
+  [/\b(simple|simplify|easily|asani|samjha|smj|clear)\b/i, 'put it more simply'],
+  [/\b(short|chhota|chota|concise)\b/i, 'keep it shorter'],
+];
+
+function describeForm(metaText) {
+  const hit = FORM_HINTS.find(([re]) => re.test(metaText));
+  return hit ? hit[1] : null;
+}
+
+// Walk the recent turns backwards for the last message that was actually a
+// question about the book. The meta turn is an instruction about ITS answer.
+function lastBookQuestion(recentMessages = []) {
+  for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+    const m = recentMessages[i];
+    if (m?.role !== 'user') continue;
+    const prior = understandQuery({ message: m.content, recentMessages: [] });
+    if (prior.kind === 'book') return prior;
+  }
+  return null;
+}
+
+function buildConversationalMessages({ text, bookTitle, language }) {
+  return [
+    {
+      role: 'system',
+      content: [
+        `You are the research assistant for "${bookTitle}". The user's latest message is about the conversation, not a question about the book, and there is no earlier question in this chat for it to apply to.`,
+        '',
+        'Reply in 1-2 natural sentences: acknowledge what they said, say in your own words that you answer questions grounded in this book and show the exact page each answer came from, and invite them to ask something about the book.',
+        '',
+        'ABSOLUTE RULES — you have no retrieved passages right now:',
+        '- Do not state, hint at or guess any fact, event, character, argument, quotation, chapter or page from any book.',
+        '- Do not say that you searched, found or could not find anything.',
+        '- No JSON, no markdown, no bullet lists, never begin with "As an AI".',
+        '',
+        plainLanguageRule(language),
+      ].join('\n'),
+    },
+    { role: 'user', content: `USER MESSAGE: ${text}` },
+  ];
+}
+
+// Used when the model is unavailable — still written in the user's language, and
+// still claiming nothing about the book.
+function conversationalFallback(language) {
+  if (language === 'hi') {
+    return 'नमस्ते! मैं इस किताब के बारे में आपके सवालों का जवाब दे सकता हूँ, और हर जवाब के साथ ये भी बताता हूँ कि वह किस पेज से आया। किताब से जुड़ा कोई सवाल पूछिए।';
+  }
+  if (language === 'hinglish') {
+    return 'Haan bhai, bol! Is kitab ke baare me jo sawaal ho puch le — main jawab usi kitab ki lines se deta hu aur ye bhi bata deta hu ki kaunse page se aaya hai.';
+  }
+  return 'Sure — ask me anything about the book and I will answer from its indexed passages, with the page each answer came from.';
+}
+
+async function respondToConversationalTurn({
+  runQuery, conversationId, bookId, editionId, text, understood, scope, groq, emit, now,
+}) {
+  emit('retrieval_skipped', { reason: 'conversational_turn' });
+  emit('generating', {});
+  const t0 = now();
+  const language = understood.language;
+  let answer = '';
+  try {
+    const raw = await groq(
+      buildConversationalMessages({ text, bookTitle: scope.book_title, language }),
+      { json: false, temperature: 0.6 }
+    );
+    if (typeof raw === 'string') answer = raw.trim();
+  } catch {
+    // An unconfigured or failing model must not break a greeting.
+    answer = '';
+  }
+  if (!answer || answer.length > 600) answer = conversationalFallback(language);
+  const generateMs = now() - t0;
+
+  emit('answer_chunk', { delta: answer });
+  emit('sources_ready', { sources: [] });
+  await persistExchange(runQuery, {
+    conversationId,
+    userText: text,
+    answerText: answer,
+    evidenceMeta: { confidence: 'conversational', evidenceIds: [], reason: 'conversational_turn' },
+  });
+
+  return {
+    status: 'conversational',
+    answer,
+    confidence: 'conversational',
+    citations: [],
+    evidenceIds: [],
+    bookId,
+    editionId,
+    conversationId,
+    debug: buildDebug({
+      understood, vectorResults: [], lexicalResults: [], fused: [],
+      rerankProvider: 'NOT_RUN', finalCount: 0,
+      embedMs: 0, retrievalMs: 0, rerankMs: 0, generateMs, insufficient: false,
+      conversational: true,
+    }),
+  };
+}
+
 export async function researchQuery(input, deps = {}) {
   const {
     runQuery = defaultQuery,
@@ -131,8 +252,25 @@ export async function researchQuery(input, deps = {}) {
   // --- §6/§7/§8 query understanding ----------------------------------------
   const recent = await loadRecentMessages(runQuery, conversationId, ragConfig.contextMessageLimit);
   const understood = understandQuery({ message: text, recentMessages: recent });
-  if (understood.isFollowUp && understood.searchQuery !== understood.original) {
-    emit('query_rewritten', { originalQuery: understood.original, searchQuery: understood.searchQuery });
+
+  // A turn that carries nothing searchable is an instruction about the previous
+  // answer. Re-serve the last real book question in the language/form the user
+  // just asked for; the evidence still comes from a real retrieval run.
+  const prior = understood.kind === 'meta' ? lastBookQuestion(recent) : null;
+  if (understood.kind === 'meta' && !prior) {
+    return await respondToConversationalTurn({
+      runQuery, conversationId, bookId, editionId, text, understood, scope, groq, emit, now,
+    });
+  }
+  const turn = prior ? { ...prior, language: understood.language } : understood;
+  // Tell the model plainly that the message it is being handed is the previous
+  // question, and what the user's latest words actually asked for — a change of
+  // form, never new content to invent.
+  const formNote = prior
+    ? `their latest message was only "${understood.original}", which asks you to ${understood.intent === 'language' ? `say it in ${LANGUAGE_NAMES[understood.language] ?? 'that language'}` : (describeForm(understood.original) ?? 'answer it again')}`
+    : null;
+  if (turn.isFollowUp && turn.searchQuery !== turn.original) {
+    emit('query_rewritten', { originalQuery: turn.original, searchQuery: turn.searchQuery });
   }
 
   // --- §9/§10 hybrid retrieval (real providers only) ------------------------
@@ -152,7 +290,7 @@ export async function researchQuery(input, deps = {}) {
     emit('searching', { stage: 'vector' });
     const t0 = now();
     try {
-      const vector = await embedQuery(provider, understood.searchQuery, { expectedDim: ragConfig.embeddingDim });
+      const vector = await embedQuery(provider, turn.searchQuery, { expectedDim: ragConfig.embeddingDim });
       embedMs = now() - t0;
       vectorResults = await vectorRetrieval({
         vector,
@@ -173,14 +311,14 @@ export async function researchQuery(input, deps = {}) {
   // embeddings are absent (NULL) and similarity returns nothing. In both cases
   // full-text retrieval is the only honest signal left, so always run it.
   const vectorsEmpty = vectorUnavailable || vectorResults.length === 0;
-  const runLexical = vectorsEmpty || understood.lexicalNeeded;
+  const runLexical = vectorsEmpty || turn.lexicalNeeded;
   // websearch_to_tsquery ANDs the content words of a full sentence, which
   // strands recall to 0 when it is our only signal. When the vector leg gave
   // nothing, match ANY key term instead; OR-ing the query's own words lets
   // ts_rank reward the passages that carry the most of them. Each word is
   // quoted so a multi-word name stays a phrase; websearch honours quotes.
-  const recallTerms = (understood.keywords ?? []).map((k) => `"${k}"`).join(' OR ');
-  const lexicalQuery = vectorsEmpty && recallTerms ? recallTerms : understood.searchQuery;
+  const recallTerms = (turn.keywords ?? []).map((k) => `"${k}"`).join(' OR ');
+  const lexicalQuery = vectorsEmpty && recallTerms ? recallTerms : turn.searchQuery;
   if (runLexical) emit('searching', { stage: 'lexical' });
   const lexicalResults = runLexical
     ? await lexicalRetrieval({
@@ -216,27 +354,29 @@ export async function researchQuery(input, deps = {}) {
   // zero claims, and citations stay empty.
   if (!rerankDecision.sufficient) {
     const searchedTerms = [
-      ...(understood.keywords ?? []),
-      ...(understood.resolvedSubject ? [understood.resolvedSubject] : []),
+      ...(turn.keywords ?? []),
+      ...(turn.resolvedSubject ? [turn.resolvedSubject] : []),
     ];
     const canAsk = groqConfigured();
     const answer = canAsk
       ? await generateNoEvidenceNote({
-          question: text,
+          question: turn.original,
           bookContext: { title: scope.book_title, editionLabel: scope.edition_label },
           searchedTerms,
+          answerLanguage: understood.language,
           groq,
         })
       : noEvidenceFallback({
-          question: text,
+          question: turn.original,
           bookContext: { title: scope.book_title },
           searchedTerms,
         });
 
     const debug = buildDebug({
-      understood, vectorResults, lexicalResults, fused,
+      understood: turn, vectorResults, lexicalResults, fused,
       rerankProvider: 'NOT_RUN', finalCount: 0, embedMs, retrievalMs,
       rerankMs: 0, generateMs: 0, insufficient: true, vectorUnavailable,
+      asked: prior ? text : null,
     });
     const result = {
       status: 'insufficient',
@@ -265,7 +405,7 @@ export async function researchQuery(input, deps = {}) {
   // --- §14/§15 rerank + evidence budget ------------------------------------
   const t3 = now();
   const { provider: rerankProvider, ranked } = await rerank({
-    query: understood.searchQuery,
+    query: turn.searchQuery,
     candidates: fused,
     reranker,
     topN: ragConfig.rerankerTopN,
@@ -286,10 +426,12 @@ export async function researchQuery(input, deps = {}) {
   emit('generating', {});
   const t4 = now();
   const genArgs = {
-    question: understood.original,
+    question: turn.original,
     evidence,
     contextMessages: recent,
     bookContext: { title: scope.book_title, editionLabel: scope.edition_label },
+    answerLanguage: understood.language,
+    formNote,
   };
   let generated;
   if (streaming) {
@@ -324,10 +466,11 @@ export async function researchQuery(input, deps = {}) {
   emit('sources_ready', { sources: citations });
 
   const debug = buildDebug({
-    understood, vectorResults, lexicalResults, fused,
+    understood: turn, vectorResults, lexicalResults, fused,
     rerankProvider, finalCount: evidence.length,
     embedMs, retrievalMs, rerankMs, generateMs, insufficient: false,
     rejectedEvidenceIds: generated.rejectedEvidenceIds, vectorUnavailable,
+    asked: prior ? text : null,
   });
 
   const result = {
@@ -362,11 +505,14 @@ export async function researchQuery(input, deps = {}) {
 function buildDebug({
   understood, vectorResults, lexicalResults, fused, rerankProvider,
   finalCount, embedMs, retrievalMs, rerankMs, generateMs, insufficient, rejectedEvidenceIds = [], vectorUnavailable = false,
+  conversational = false, asked = null,
 }) {
   // §23 internal-only. Timings are measured, never fabricated. The route only
   // forwards this when explicitly requested (debug mode), never to normal users.
   return {
     query: understood.original,
+    // When the user's message was a form request, this is the question it pointed at.
+    ...(asked ? { asked } : {}),
     rewrittenQuery: understood.isFollowUp ? understood.searchQuery : null,
     resolvedSubject: understood.resolvedSubject,
     counts: {
@@ -378,6 +524,7 @@ function buildDebug({
     },
     reranker: typeof rerankProvider === 'string' ? rerankProvider : rerankProvider,
     insufficient,
+    ...(conversational ? { conversational: true } : {}),
     vectorUnavailable,
     rejectedEvidenceIds,
     timingMs: { embed: embedMs, retrieval: retrievalMs, rerank: rerankMs, generate: generateMs },

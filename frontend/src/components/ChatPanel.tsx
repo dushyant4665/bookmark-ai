@@ -157,6 +157,11 @@ export function ChatPanel({ onOpenSource }: { onOpenSource?: (e: Evidence) => vo
             case 'query_rewritten':
               setActivity('Understanding your question…');
               break;
+            case 'retrieval_skipped':
+              // A conversational turn ("ok", "hindi me bta") has nothing to
+              // search; saying so beats showing a fake "Searching…" state.
+              setActivity('Answering…');
+              break;
             case 'searching':
               setActivity('Searching the book…');
               break;

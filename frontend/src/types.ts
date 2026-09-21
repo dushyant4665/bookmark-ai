@@ -86,6 +86,7 @@ export type ChatStreamEvent =
   | 'request_received'
   | 'context_resolved'
   | 'query_rewritten'
+  | 'retrieval_skipped'
   | 'searching'
   | 'retrieval_complete'
   | 'reranking'

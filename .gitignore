@@ -1,0 +1,25 @@
+# Dependencies & builds
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets — never commit real credentials. Only *.env.example belong in git.
+.env
+.env.local
+.env.*.local
+
+# Logs & scratch
+*.log
+tmp/
+tmp-*.txt
+tmp-*.json
+tmp-*.pdf
+
+# Local book data / downloaded PDFs (served from Supabase Storage in production)
+backend/data/books/*
+!backend/data/books/.gitkeep
+backend/storage/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

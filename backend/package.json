@@ -1,0 +1,33 @@
+{
+  "name": "bookmark-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BOOKMARK - AI book research backend (Express + Postgres/pgvector + Groq)",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/db/migrate.js",
+    "ingest:book": "node src/scripts/ingest.js",
+    "ingest:embeddings": "node src/scripts/embeddings.js",
+    "verify:book": "node src/scripts/verify.js",
+    "verify:production": "node src/scripts/verifyProduction.js",
+    "publish:storage": "node scripts/publish-storage.mjs",
+    "check": "node --check src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pdfjs-dist": "^4.7.76",
+    "pdfkit": "^0.15.0",
+    "pg": "^8.12.0"
+  }
+}

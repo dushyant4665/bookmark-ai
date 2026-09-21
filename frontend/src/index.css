@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-surface-sunken text-ink font-sans antialiased;
+  margin: 0;
+}
+
+::selection {
+  background: #f3ede6;
+  color: #1a1a1a;
+}
+
+/* Consistent, visible keyboard focus (accessibility requirement). */
+:where(button, a, input, textarea, [tabindex]):focus-visible {
+  outline: 2px solid theme('colors.accent.DEFAULT');
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Thin, unobtrusive scrollbars for the reading + chat panes. */
+.bm-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.bm-scroll::-webkit-scrollbar-thumb {
+  background: #d9d5cf;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* Answers arrive token by token; a soft entrance keeps the stream from jumping. */
+@keyframes bm-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.bm-rise {
+  animation: bm-rise 0.22s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bm-rise {
+    animation: none;
+  }
+}
+
+/* The reading pane's paper, kept subtle. */
+.ReactPDF {
+  margin-inline: auto;
+}

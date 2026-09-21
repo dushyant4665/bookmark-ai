@@ -111,6 +111,43 @@ const FILLER = new Set([
   'reply', 'write', 'kindly', 'question', 'doubt', 'topic',
 ]);
 
+// Words that ask for the PREVIOUS answer in another form. They only make sense
+// as an instruction about the conversation, so a meta turn holding one of them
+// re-serves the last real book question instead of getting a chat reply.
+const FORM_REQUEST = new Set([
+  'bata', 'batao', 'batado', 'batade', 'btana', 'bta', 'bto', 'bol', 'bolo', 'bolen',
+  'dobara', 'dubara', 'phir', 'fir', 'repeat', 'rephrase', 'again', 're',
+  'age', 'aage', 'jaari', 'zari', 'continue', 'next', 'badhao', 'badhaao', 'badao', 'rakh', 'rakho',
+  'detail', 'detailed', 'details', 'elaborate', 'expand', 'zyada', 'jyada', 'bahut', 'bhut',
+  'bohot', 'poora', 'pura', 'thoda', 'thora', 'zara', 'jara', 'example', 'examples', 'udahar',
+  'simple', 'simplify', 'easily', 'asani', 'clear', 'clearly', 'proper', 'properly',
+  'short', 'shorter', 'chhota', 'chota', 'concise', 'matlab',
+]);
+
+// Small talk. The turn must contain at least one CORE greeting/acknowledgement
+// word and every other word must be small-talk glue, so "what is good?" keeps
+// its 'good' as a topic while "good morning" and "hi bhai" are recognised as
+// talk aimed at the assistant.
+const GREET_CORE = new Set([
+  'hi', 'hii', 'hiii', 'hlo', 'helo', 'hello', 'halllo', 'helllo', 'halo', 'hey', 'heya',
+  'yo', 'sup', 'namaste', 'namaskar', 'salaam', 'salam', 'adab', 'ok', 'okay', 'okey', 'kk',
+  'thx', 'ty', 'thanks', 'bye', 'goodbye', 'tc', 'gm', 'gn', 'haha', 'hehe', 'lol', 'yay',
+  'oops', 'yep', 'yeah', 'hmm', 'hm', 'oh', 'ah', 'morning', 'afternoon', 'evening', 'night',
+  'kaise', 'kaisa', 'badiya', 'badriya', 'vadima', 'chal', 'chalo', 'chl', 'greet',
+]);
+const GREET_GLUE = new Set([
+  'good', 'how', 'are', 'you', 'u', 'it', 's', 'doing', 'goes', 'there', 'nice', 'cool',
+  'awesome', 'wow', 'friend', 'dost', 'yaar', 'bhai', 'bhia', 'bhaiya', 'mate', 'all', 'sab',
+  'aap', 'tum', 'who', 'r', 'am', 'kaun', 'today', 'day', 'theek', 'thik', 'sahi', 'sahee', 'ho',
+]);
+
+function isSmallTalk(text) {
+  const tokens = String(text).toLowerCase().split(/[^\p{L}\p{N}']+/u).filter(Boolean);
+  if (!tokens.length) return false;
+  return tokens.some((t) => GREET_CORE.has(t))
+    && tokens.every((t) => GREET_CORE.has(t) || GREET_GLUE.has(t) || STOPWORDS.has(t));
+}
+
 const DEVANAGARI = /[\u0900-\u097F]/;
 
 // Words that only occur in Hindi/Hinglish speech. Two of them in one message is
@@ -127,13 +164,16 @@ const HINGLISH_MARKERS = new Set([
 
 // Which script/register the user actually typed in. Answers must come back in
 // the same language — a Hindi question should not be answered only in English.
-export function detectLanguage(text) {
+// `minHinglishWords` is relaxed for small talk: a greeting carrying even one
+// Hindi word ("hi bhai") is casual Hinglish, while one stray Hindi word inside a
+// real English book question must not flip the whole answer's register.
+export function detectLanguage(text, { minHinglishWords = 2 } = {}) {
   const s = String(text ?? '');
   if (DEVANAGARI.test(s)) return 'hi';
   const words = s.toLowerCase().split(/[^\p{L}\p{N}'’-]+/u).filter(Boolean);
   const hindiWords = words.filter((w) => HINGLISH_MARKERS.has(w)).length;
   // Two markers is the line between "what does Ivan say" and "bhai ye kya hai".
-  return hindiWords >= 2 ? 'hinglish' : 'en';
+  return hindiWords >= minHinglishWords ? 'hinglish' : 'en';
 }
 
 // Remove the conversational glue from an already-stopword-filtered keyword set.
@@ -194,9 +234,18 @@ export function understandQuery({ message, recentMessages = [] }) {
   // A turn with nothing searchable in it is a conversation about the
   // conversation, not a question to the book. Retrieval must not run on it —
   // that is what produced "I could not find the words chal, bhai, thik".
-  const kind = searchable.length === 0 ? 'meta' : 'book';
+  // Small talk is meta even when a greeting word survives the filler filter
+  // ("good morning"), because it was never aimed at the book either.
+  const smallTalk = isSmallTalk(original);
+  const kind = smallTalk || searchable.length === 0 ? 'meta' : 'book';
+  // What a meta turn actually asks for: another language, another form of the
+  // previous answer, or simply a reply as a conversation would give one.
   const intent = kind === 'meta'
-    ? (requested || /hindi|english|urdu|bhasha|translate|translation|anuvaad|matlab|language/i.test(original) ? 'language' : 'restate')
+    ? (requested || /hindi|english|urdu|bhasha|translate|translation|anuvaad|matlab|language/i.test(original)
+        ? 'language'
+        : original.toLowerCase().split(/[^\p{L}\p{N}']+/u).some((w) => FORM_REQUEST.has(w))
+          ? 'form'
+          : 'social')
     : null;
 
   return {

@@ -132,6 +132,73 @@ test('language rules ask for the user register and forbid translating evidence',
 // A meta turn re-serves the previous real question
 // ---------------------------------------------------------------------------
 
+// A greeting is small talk, not a request about the previous answer. It must
+// never replay that answer: "hello" once produced a paragraph about the
+// Karamazov narrator because a book question happened to be in the context.
+test('a greeting is classified as social, while a form or language request is not', () => {
+  for (const text of ['hello', 'hello\\', 'hi', 'hii', 'ok', 'thanks', 'hey there', 'good morning', 'how are you', 'who are you?', 'salaam bhai']) {
+    assert.equal(understandQuery({ message: text, recentMessages: [] }).intent, 'social', text);
+  }
+  assert.equal(understandQuery({ message: 'aage badhao', recentMessages: [] }).intent, 'form');
+  assert.equal(understandQuery({ message: 'thoda detail me bta', recentMessages: [] }).intent, 'form');
+  assert.equal(understandQuery({ message: 'chal bhai thik hindi me bta', recentMessages: [] }).intent, 'language');
+  // A short question that merely shares a word with a greeting is still a question.
+  assert.equal(understandQuery({ message: 'what is good?', recentMessages: [] }).kind, 'book');
+});
+
+test('a greeting mid-conversation answers as a greeting and never replays the last answer', async () => {
+  const { seen, runQuery, makeProvider } = harness({
+    messages: [
+      { role: 'user', content: PRIOR_QUESTION },
+      { role: 'assistant', content: 'Ivan rejects God because of the suffering of children.' },
+    ],
+    ...evidenceRows(),
+  });
+  let prompt = null;
+  const res = await researchQuery(
+    { userId: 'u', conversationId: 'c', bookId: 'b', editionId: 'e', message: 'hello' },
+    {
+      runQuery,
+      makeProvider,
+      reranker: null,
+      groq: async (messages, opts) => {
+        prompt = { messages, opts };
+        return 'Hello! What would you like to know about The Brothers Karamazov?';
+      },
+    }
+  );
+
+  assert.equal(seen.vectorSql.length, 0, 'a greeting must not trigger vector search');
+  assert.equal(seen.lexicalSql.length, 0, 'a greeting must not trigger full-text search');
+  assert.equal(seen.embedTexts.length, 0, 'nothing to embed');
+  assert.equal(res.status, 'conversational');
+  assert.deepEqual(res.citations, []);
+  // The previous book question is NOT handed to the model as the question.
+  assert.ok(!prompt.messages[1].content.includes(PRIOR_QUESTION), 'the last answer must not be replayed');
+  assert.ok(!/EVIDENCE/.test(prompt.messages[0].content), 'no evidence is invented for a greeting');
+  assert.match(prompt.messages[0].content, /small talk/i);
+  assert.equal(prompt.opts.json, false);
+});
+
+test('a greeting in Hinglish is answered in Hinglish', async () => {
+  const { runQuery, makeProvider } = harness({ messages: [] });
+  let prompt = null;
+  const res = await researchQuery(
+    { userId: 'u', conversationId: 'c', bookId: 'b', editionId: 'e', message: 'hi bhai kaise ho' },
+    {
+      runQuery,
+      makeProvider,
+      reranker: null,
+      groq: async (messages) => {
+        prompt = messages;
+        return 'Bas badhiya bhai, bol is kitab me kya dekhna hai.';
+      },
+    }
+  );
+  assert.equal(res.status, 'conversational');
+  assert.match(prompt[0].content, /Hinglish/);
+});
+
 test('a Hinglish "bta in hindi" answers the previous question, never searches the filler', async () => {
   const { seen, runQuery, makeProvider } = harness({
     messages: [

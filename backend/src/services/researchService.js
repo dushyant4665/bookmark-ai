@@ -94,12 +94,14 @@ async function persistExchange(runQuery, { conversationId, userText, answerText,
 // ---------------------------------------------------------------------------
 // Conversational turns
 //
-// "chal bhai thik hindi me bta", "ok", "aage badhao" ask for a different FORM of
-// the previous answer, not for new content — so there is nothing in them to
-// search for. Running full-text retrieval on them used to produce "I could not
-// find the words chal, bhai, thik". Instead: re-serve the last real book
-// question in the requested language/form, and if there is no earlier question
-// to act on, reply as a conversation would (with no claims about the book).
+// A turn with nothing searchable in it is talk about the conversation, not a
+// question to the book; searching it used to produce "I could not find the
+// words chal, bhai, thik". There are two very different kinds, and they get
+// very different replies:
+//   - a request about the PREVIOUS answer ("hindi me bta", "aage badhao",
+//     "thoda detail me") → re-serve the last real book question in that form;
+//   - small talk ("hello", "ok", "thanks") → answer as a conversation would,
+//     even when an earlier book question is on screen.
 
 // Names used to tell the model which language the user asked to be answered in.
 const LANGUAGE_NAMES = { hi: 'Hindi', hinglish: 'Hinglish', en: 'English' };
@@ -131,14 +133,16 @@ function lastBookQuestion(recentMessages = []) {
   return null;
 }
 
-function buildConversationalMessages({ text, bookTitle, language }) {
+function buildConversationalMessages({ text, bookTitle, language, social }) {
   return [
     {
       role: 'system',
       content: [
-        `You are the research assistant for "${bookTitle}". The user's latest message is about the conversation, not a question about the book, and there is no earlier question in this chat for it to apply to.`,
+        social
+          ? `You are the research assistant for "${bookTitle}". The user's message is small talk — a greeting, an acknowledgement or a word aimed at you — not a question about the book, so it is not something to look up.`
+          : `You are the research assistant for "${bookTitle}". The user's message asks you to change the form of an earlier answer, but there is no earlier question in this chat for it to apply to, so there is nothing to restate.`,
         '',
-        'Reply in 1-2 natural sentences: acknowledge what they said, say in your own words that you answer questions grounded in this book and show the exact page each answer came from, and invite them to ask something about the book.',
+        `Reply in 1-2 warm, natural sentences${social ? ', the way a helpful person answers a greeting' : ''}: acknowledge what they said, then ask what they would like to know about the book. Say in your own words that you answer from this book itself and that each answer comes with the exact page it came from.`,
         '',
         'ABSOLUTE RULES — you have no retrieved passages right now:',
         '- Do not state, hint at or guess any fact, event, character, argument, quotation, chapter or page from any book.',
@@ -159,22 +163,23 @@ function conversationalFallback(language) {
     return 'नमस्ते! मैं इस किताब के बारे में आपके सवालों का जवाब दे सकता हूँ, और हर जवाब के साथ ये भी बताता हूँ कि वह किस पेज से आया। किताब से जुड़ा कोई सवाल पूछिए।';
   }
   if (language === 'hinglish') {
-    return 'Haan bhai, bol! Is kitab ke baare me jo sawaal ho puch le — main jawab usi kitab ki lines se deta hu aur ye bhi bata deta hu ki kaunse page se aaya hai.';
+    return 'Hello bhai! Bol, is kitab ke baare me kya jaanna hai — main jawab seedhi usi kitab ki lines se deta hu aur ye bhi bata deta hu ki baat kaunse page par hai.';
   }
-  return 'Sure — ask me anything about the book and I will answer from its indexed passages, with the page each answer came from.';
+  return 'Hello! Ask me anything about this book and I will answer from its own passages, with the exact page each answer came from.';
 }
 
 async function respondToConversationalTurn({
   runQuery, conversationId, bookId, editionId, text, understood, scope, groq, emit, now,
 }) {
-  emit('retrieval_skipped', { reason: 'conversational_turn' });
+  const social = understood.intent === 'social';
+  emit('retrieval_skipped', { reason: social ? 'small_talk' : 'no_previous_question' });
   emit('generating', {});
   const t0 = now();
   const language = understood.language;
   let answer = '';
   try {
     const raw = await groq(
-      buildConversationalMessages({ text, bookTitle: scope.book_title, language }),
+      buildConversationalMessages({ text, bookTitle: scope.book_title, language, social }),
       { json: false, temperature: 0.6 }
     );
     if (typeof raw === 'string') answer = raw.trim();
@@ -253,9 +258,17 @@ export async function researchQuery(input, deps = {}) {
   const recent = await loadRecentMessages(runQuery, conversationId, ragConfig.contextMessageLimit);
   const understood = understandQuery({ message: text, recentMessages: recent });
 
-  // A turn that carries nothing searchable is an instruction about the previous
-  // answer. Re-serve the last real book question in the language/form the user
-  // just asked for; the evidence still comes from a real retrieval run.
+  // A turn that asks for another LANGUAGE or another FORM of the previous
+  // answer is re-served against the last real book question — the evidence
+  // still comes from a real retrieval run. A SOCIAL turn ("hello", "ok",
+  // "thanks") is answered as conversation instead: replaying the previous
+  // answer for a greeting is what made "hello" produce a paragraph about the
+  // Karamazov narrator.
+  if (understood.kind === 'meta' && understood.intent === 'social') {
+    return await respondToConversationalTurn({
+      runQuery, conversationId, bookId, editionId, text, understood, scope, groq, emit, now,
+    });
+  }
   const prior = understood.kind === 'meta' ? lastBookQuestion(recent) : null;
   if (understood.kind === 'meta' && !prior) {
     return await respondToConversationalTurn({

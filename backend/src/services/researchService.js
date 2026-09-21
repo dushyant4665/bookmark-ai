@@ -3,6 +3,7 @@ import { makeEmbeddingProvider, embedQuery } from '../ingest/embeddingProvider.j
 import { understandQuery } from '../retrieval/queryUnderstanding.js';
 import { vectorRetrieval } from '../retrieval/vectorRetrieval.js';
 import { lexicalRetrieval } from '../retrieval/lexicalRetrieval.js';
+import { spreadRetrieval } from '../retrieval/spreadRetrieval.js';
 import { rrfFusion } from '../retrieval/hybridFusion.js';
 import { toEvidence, toCitation } from '../retrieval/evidence.js';
 import { attachRectsToEvidence } from '../retrieval/geometry.js';
@@ -354,10 +355,32 @@ export async function researchQuery(input, deps = {}) {
   const fused = rrfFusion(vectorResults, lexicalResults, { limit: ragConfig.hybridCandidateCount });
   const rerankDecision = decideSufficiency(fused);
 
+  // A whole-book question ("what is the story?", "what is this about?") is not
+  // answerable from the five chunks nearest that sentence — they come from one
+  // corner of the book, and the model honestly reported that they contain no
+  // summary. For those turns the evidence is one real passage sampled from each
+  // slice of the book, in reading order.
+  let spread = [];
+  if (turn.scope === 'whole_book') {
+    try {
+      spread = await spreadRetrieval({
+        bookId,
+        editionId,
+        sourceId: scope.source_id,
+        tiles: ragConfig.finalEvidenceCount,
+        runQuery,
+      });
+    } catch {
+      spread = []; // a failed sample must not break the turn: fall back to hybrid
+    }
+  }
+  const useSpread = spread.length >= 2;
+
   emit('retrieval_complete', {
     vectorCandidates: vectorResults.length,
     lexicalCandidates: lexicalResults.length,
     hybridCandidates: fused.length,
+    spreadCandidates: spread.length,
   });
 
   // §20/§21 stop before spending a Groq call on weak/no evidence. Nothing is
@@ -365,7 +388,7 @@ export async function researchQuery(input, deps = {}) {
   // describes the miss itself, so the user gets a specific, human reply instead
   // of the same canned sentence on every input. Still zero evidence => still
   // zero claims, and citations stay empty.
-  if (!rerankDecision.sufficient) {
+  if (!useSpread && !rerankDecision.sufficient) {
     const searchedTerms = [
       ...(turn.keywords ?? []),
       ...(turn.resolvedSubject ? [turn.resolvedSubject] : []),
@@ -417,13 +440,22 @@ export async function researchQuery(input, deps = {}) {
 
   // --- §14/§15 rerank + evidence budget ------------------------------------
   const t3 = now();
-  const { provider: rerankProvider, ranked } = await rerank({
-    query: turn.searchQuery,
-    candidates: fused,
-    reranker,
-    topN: ragConfig.rerankerTopN,
-  });
-  const finalCandidates = ranked.slice(0, ragConfig.finalEvidenceCount);
+  let rerankProvider = 'NOT_RUN';
+  let finalCandidates;
+  if (useSpread) {
+    // The sample IS the evidence set, in page order. Reranking it by similarity
+    // to "what is the story" would collapse it back onto one region of the book.
+    finalCandidates = spread;
+  } else {
+    const ranked = await rerank({
+      query: turn.searchQuery,
+      candidates: fused,
+      reranker,
+      topN: ragConfig.rerankerTopN,
+    });
+    rerankProvider = ranked.provider;
+    finalCandidates = ranked.ranked.slice(0, ragConfig.finalEvidenceCount);
+  }
   // §18 opaque ids in final-evidence order; e1 is the strongest.
   const evidence = finalCandidates.map((c, i) => toEvidence(c, `e${i + 1}`));
   const rerankMs = now() - t3;
@@ -432,7 +464,9 @@ export async function researchQuery(input, deps = {}) {
   // provider actually produced the ordering (never for the hybrid fallback).
   const rerankConfigured =
     rerankProvider && rerankProvider !== 'NOT_CONFIGURED' && rerankProvider !== 'HYBRID_FALLBACK_AFTER_ERROR';
-  emit('reranking', { provider: rerankConfigured ? 'configured_reranker' : 'hybrid_fallback' });
+  emit('reranking', {
+    provider: useSpread ? 'whole_book_sample' : rerankConfigured ? 'configured_reranker' : 'hybrid_fallback',
+  });
   emit('evidence_selected', { evidenceCount: evidence.length });
 
   // --- §16/§17 grounded generation -----------------------------------------
@@ -445,6 +479,9 @@ export async function researchQuery(input, deps = {}) {
     bookContext: { title: scope.book_title, editionLabel: scope.edition_label },
     answerLanguage: understood.language,
     formNote,
+    // Tells the prompt it is holding a spread sample of the whole book, so it
+    // summarises instead of reporting that the excerpts lack a summary.
+    wholeBook: useSpread,
   };
   let generated;
   if (streaming) {
@@ -484,6 +521,7 @@ export async function researchQuery(input, deps = {}) {
     embedMs, retrievalMs, rerankMs, generateMs, insufficient: false,
     rejectedEvidenceIds: generated.rejectedEvidenceIds, vectorUnavailable,
     asked: prior ? text : null,
+    spreadCount: spread.length,
   });
 
   const result = {
@@ -518,7 +556,7 @@ export async function researchQuery(input, deps = {}) {
 function buildDebug({
   understood, vectorResults, lexicalResults, fused, rerankProvider,
   finalCount, embedMs, retrievalMs, rerankMs, generateMs, insufficient, rejectedEvidenceIds = [], vectorUnavailable = false,
-  conversational = false, asked = null,
+  conversational = false, asked = null, spreadCount = 0,
 }) {
   // §23 internal-only. Timings are measured, never fabricated. The route only
   // forwards this when explicitly requested (debug mode), never to normal users.
@@ -528,11 +566,13 @@ function buildDebug({
     ...(asked ? { asked } : {}),
     rewrittenQuery: understood.isFollowUp ? understood.searchQuery : null,
     resolvedSubject: understood.resolvedSubject,
+    scope: understood.scope ?? 'passage',
     counts: {
       vector: vectorResults.length,
       lexical: lexicalResults.length,
       hybrid: fused.length,
       reranked: fused.length,
+      spread: spreadCount,
       finalEvidence: finalCount,
     },
     reranker: typeof rerankProvider === 'string' ? rerankProvider : rerankProvider,

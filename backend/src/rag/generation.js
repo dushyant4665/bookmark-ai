@@ -48,6 +48,20 @@ function answerFormatRule() {
   ].join('\n');
 }
 
+// A whole-book question gets a sample spread across the book rather than the
+// nearest few passages, and needs to be told what it is holding: without this
+// the model described the SAMPLE ("these excerpts contain no summary") instead
+// of doing the task, which is exactly the shrug the user is shown.
+function wholeBookRule() {
+  return [
+    'This question is about the BOOK AS A WHOLE, and the passages below are a deliberate sample: one real passage from each slice of the book, in reading order from its first pages to its last. They are not the only text the book contains.',
+    '- Answer the question about the book itself from that sample. Summarising, describing the story or stating what the book argues IS the task.',
+    '- Do NOT describe or comment on the sample ("the provided passages do not include a summary", "these are only excerpts"). Never hand the user back their own question as a suggestion.',
+    '- Cover the arc: what the book opens with, what it develops, what it concludes — in the order the passages arrive.',
+    '- Say which parts of the book you did not see only if the sample is genuinely empty or unreadable.',
+  ].join('\n');
+}
+
 // Replies that carry no evidence — a conversational turn, or a search that
 // matched nothing — must not talk about an EVIDENCE block the model never got.
 export function plainLanguageRule(answerLanguage = 'en') {
@@ -127,19 +141,38 @@ export async function generateNoEvidenceNote({
 
 const ALLOWED_CONFIDENCE = new Set(['supported', 'partially_supported', 'insufficient']);
 
+// The grounding contract, shared by the JSON and streaming prompts so the two
+// cannot drift apart on the one thing users notice: when a refusal is allowed.
+function groundingRules({ wholeBook = false } = {}) {
+  return [
+    '- Do not invent facts, quotations, page numbers, chapter names, or coordinates.',
+    '- Do not claim something appears in the book unless the supplied evidence supports it.',
+    '- Do not fill gaps with general world knowledge. This application is book-grounded and has no web search.',
+    '- Answer FIRST, qualify SECOND. If an excerpt names the person, scene or argument the question asks about, lead with what that excerpt says and cite its id; add at most one short clause about what the passages do not settle.',
+    '- A passage that says the thing in different words still says the thing. It does not have to quote the question\'s phrasing to answer it, and a question you can half-answer is not a question you refuse.',
+    '- "These passages do not cover that" is a last resort, true only when NO excerpt below touches the person, term or event asked about.',
+    ...(wholeBook
+      ? [
+        `- ${wholeBookRule()}`,
+        '- Set confidence to "supported" or "partially_supported" and list the ids you drew on.',
+      ]
+      : [
+        '- If the evidence genuinely does not cover the question — including questions about something outside this book (weather, news, other books, a name that does not appear) — do NOT answer it and do NOT guess. Instead write 1-2 plain, natural sentences saying that the passages retrieved from this book do not cover what was asked, name what they asked in your own words, and suggest a closer question about the book. Say it as a limit of the retrieved passages, never as a claim that the book "never mentions" something. Do not repeat a fixed stock sentence — word each one for the question.',
+        '- In that case set confidence to "insufficient" and return an empty evidenceIds list.',
+      ]),
+    '- Do not manufacture certainty.',
+  ];
+}
+
 // §17 — the grounding contract. Strong, explicit, and small.
-export function buildSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) {
+export function buildSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
     'Hard rules:',
-    '- Do not invent facts, quotations, page numbers, chapter names, or coordinates.',
-    '- Do not claim something appears in the book unless the supplied evidence supports it.',
-    '- Do not fill gaps with general world knowledge. This application is book-grounded and has no web search.',
-    '- If the supplied evidence does not actually cover the question — including questions about something outside this book (weather, news, other books, a name that does not appear) — do NOT answer it and do NOT guess. Instead write 1-2 plain, natural sentences that say the passages retrieved from this book do not cover what was asked, name what they asked in your own words, and suggest a closer question about the book. Phrase it as a limit of the retrieved passages, never as a claim that the book "never mentions" something. Do not repeat a fixed stock sentence — word each one for the question.',
-    '- In that case set confidence to "insufficient" and return an empty evidenceIds list.',
+    ...groundingRules({ wholeBook }),
+    '',
     '- If supplied evidence conflicts, explain the conflict instead of silently choosing one side.',
-    '- Do not manufacture certainty.',
     '',
     'Conversation history, when present, is provided ONLY to resolve references (for example, who "he" refers to). It is NOT evidence and never overrides the book.',
     '',
@@ -196,7 +229,7 @@ function buildContextBlock(contextMessages = [], limit = ragConfig.contextMessag
 
 // §16/§17 — the full message array. Groq receives the question, minimal
 // conversation context, the book/edition identity, and ONLY the final evidence.
-export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null }) {
+export function buildMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -207,7 +240,7 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: buildSystemPrompt({ answerLanguage, formNote }) },
+    { role: 'system', content: buildSystemPrompt({ answerLanguage, formNote, wholeBook }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -223,17 +256,12 @@ export function buildMessages({ question, evidence = [], contextMessages = [], b
 // citation truth: the ids are membership-checked and resolved to real DB rows.
 export const CITATION_DELIM = '###EVIDENCE###';
 
-function streamingSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) {
+function streamingSystemPrompt({ answerLanguage = 'en', formNote = null, wholeBook = false } = {}) {
   return [
     'You are a book research assistant. Answer using ONLY the supplied evidence excerpts from the selected book edition.',
     '',
     'Hard rules:',
-    '- Do not invent facts, quotations, page numbers, chapter names, or coordinates.',
-    '- Do not claim something appears in the book unless the supplied evidence supports it.',
-    '- Do not fill gaps with general world knowledge. This application is book-grounded and has no web search.',
-    '- If the supplied evidence does not actually cover the question — including questions about something outside this book (weather, news, other books, a name that does not appear) — do NOT answer it and do NOT guess. Instead write 1-2 plain, natural sentences saying that the passages retrieved from this book do not cover what was asked, name what they asked in your own words, and suggest a closer question about the book. Say it as a limit of the retrieved passages, never as a claim that the book "never mentions" something. Do not repeat a fixed stock sentence — word each one for the question.',
-    '- In that case set confidence to "insufficient" and return an empty evidenceIds list.',
-    '- Do not manufacture certainty.',
+    ...groundingRules({ wholeBook }),
     '',
     'Conversation history, when present, is provided ONLY to resolve references. It is NOT evidence and never overrides the book.',
     '',
@@ -252,7 +280,7 @@ function streamingSystemPrompt({ answerLanguage = 'en', formNote = null } = {}) 
   ].join('\n');
 }
 
-export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null }) {
+export function buildStreamingMessages({ question, evidence = [], contextMessages = [], bookContext = null, answerLanguage = 'en', formNote = null, wholeBook = false }) {
   const parts = [];
   const ctx = buildContextBlock(contextMessages);
   if (ctx) parts.push(ctx, '');
@@ -263,7 +291,7 @@ export function buildStreamingMessages({ question, evidence = [], contextMessage
   }
   parts.push(buildEvidenceBlock(evidence), '', `QUESTION: ${question}`);
   return [
-    { role: 'system', content: streamingSystemPrompt({ answerLanguage, formNote }) },
+    { role: 'system', content: streamingSystemPrompt({ answerLanguage, formNote, wholeBook }) },
     { role: 'user', content: parts.join('\n') },
   ];
 }
@@ -321,11 +349,12 @@ export async function generateAnswerStreaming({
   bookContext = null,
   answerLanguage = 'en',
   formNote = null,
+  wholeBook = false,
   stream = streamChatContent,
   onDelta = null,
   signal = null,
 }) {
-  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote });
+  const messages = buildStreamingMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook });
   const splitter = createAnswerSplitter();
   let answer = '';
   for await (const chunk of stream(messages, { signal })) {
@@ -427,9 +456,10 @@ export async function generateAnswer({
   bookContext = null,
   answerLanguage = 'en',
   formNote = null,
+  wholeBook = false,
   groq = completeChat,
 }) {
-  const messages = buildMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote });
+  const messages = buildMessages({ question, evidence, contextMessages, bookContext, answerLanguage, formNote, wholeBook });
   const raw = await groq(messages);
   const parsed = parseStructuredAnswer(raw);
   if (!parsed) throw new Error('ANSWER_PARSE_FAILED');

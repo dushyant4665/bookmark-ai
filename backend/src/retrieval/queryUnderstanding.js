@@ -32,7 +32,17 @@ const STOPWORDS = new Set([
   'which', 'why', 'how', 'about', 'into', 'over', 'under', 'say', 'says',
   'said', 'tell', 'tells', 'please', 'can', 'could', 'would', 'should', 'will',
   'shall', 'may', 'might', 'must',
+  // Devanagari glue: pronouns, postpositions and the copula. Without these a
+  // Hindi question is all filler-words and punctuation, and looks empty.
+  'यह', 'ये', 'वह', 'वो', 'है', 'हैं', 'था', 'थी', 'में', 'का', 'की', 'के',
+  'को', 'से', 'पर', 'भी', 'एक', 'किस', 'कौन', 'क्या', 'क्यों', 'जब', 'कहाँ',
+  'नहीं', 'हुआ', 'लिए', 'सब', 'कुछ',
 ]);
+
+// Word splitter. Devanagari vowel signs are combining marks (\p{M}) rather than
+// letters, so a class of \p{L}\p{N} alone shreds "किताब" into single characters —
+// which made every Hindi question look like it had nothing searchable in it.
+const WORD_SEP = /[^\p{L}\p{M}\p{N}'’-]+/u;
 
 function extractProperNouns(text) {
   const seen = [];
@@ -56,7 +66,7 @@ function extractKeywords(text, properNouns) {
     seen.push(key);
   };
   for (const w of properNouns) push(w);
-  for (const w of String(text).split(/[^\p{L}\p{N}'’-]+/u)) push(w);
+  for (const w of String(text).split(WORD_SEP)) push(w);
   return seen.slice(0, 6);
 }
 
@@ -142,7 +152,7 @@ const GREET_GLUE = new Set([
 ]);
 
 function isSmallTalk(text) {
-  const tokens = String(text).toLowerCase().split(/[^\p{L}\p{N}']+/u).filter(Boolean);
+  const tokens = String(text).toLowerCase().split(WORD_SEP).filter(Boolean);
   if (!tokens.length) return false;
   return tokens.some((t) => GREET_CORE.has(t))
     && tokens.every((t) => GREET_CORE.has(t) || GREET_GLUE.has(t) || STOPWORDS.has(t));
@@ -160,6 +170,8 @@ const HINGLISH_MARKERS = new Set([
   'dubara', 'phir', 'bahut', 'zyada', 'jyada', 'thoda', 'zara', 'matlab',
   'bhasha', 'hindi', 'hinglish', 'wala', 'wali', 'aisa', 'waisa', 'yeh', 'woh',
   'meri', 'tera', 'apna', 'bas', 'abhi', 'nahin', 'haan', 'kyunki', 'chal',
+  // asking what the book is about, in Roman-script Hindi
+  'kis', 'baare', 'kitab', 'kitaab', 'poori', 'kahani', 'kahaani', 'saar',
 ]);
 
 // Which script/register the user actually typed in. Answers must come back in
@@ -170,7 +182,7 @@ const HINGLISH_MARKERS = new Set([
 export function detectLanguage(text, { minHinglishWords = 2 } = {}) {
   const s = String(text ?? '');
   if (DEVANAGARI.test(s)) return 'hi';
-  const words = s.toLowerCase().split(/[^\p{L}\p{N}'’-]+/u).filter(Boolean);
+  const words = s.toLowerCase().split(WORD_SEP).filter(Boolean);
   const hindiWords = words.filter((w) => HINGLISH_MARKERS.has(w)).length;
   // Two markers is the line between "what does Ivan say" and "bhai ye kya hai".
   return hindiWords >= minHinglishWords ? 'hinglish' : 'en';
@@ -197,6 +209,28 @@ function requestedLanguage(text) {
   // A Roman-script "hindi me bta" wants Roman-script Hindi back — the letters
   // the user is already typing with. Devanagari was handled above.
   return 'hinglish';
+}
+
+// ---------------------------------------------------------------------------
+// Whole-book questions vs questions about one passage
+//
+// "what is the story of this book?" is not a lookup — no single page answers it.
+// Retrieving the 5 chunks nearest that sentence returns five isolated
+// dialogues, and the model correctly reported that they contain no plot
+// summary. Such questions instead get a sample spread across the whole book, so
+// this detector decides the RETRIEVAL SHAPE (never what may be claimed).
+//
+// A book word ("book", "novel", "kitab") has to be the thing being asked about,
+// or the ask has to be an explicit summary — so "what does Ivan say about God"
+// stays a passage question even though it contains "about".
+const BOOK_WORD = /\b(book|books|novel|text|volume|read)\b|kitab|kitaab|granth|किताब|कتاب|ग्रंथ/i;
+const GLOBAL_ASK =
+  /\b(story|plot|summari[sz]e|summary|overview|recap|synopsis|main|central|core|overall|whole|entire|full|complete|beginning|ending|theme|message|lesson|takeaway|genre|kind|type|point|idea|about|kis\s+baare|kis\s+bart|kahani|kahaani|saar|ansh|baat)\b|कहानी|सारांश|बारे|पूरी|सारा/i;
+
+function isWholeBookQuestion(text) {
+  const s = String(text ?? '');
+  if (/\b(summari[sz]e|summary|overview|recap|synopsis|tl;?dr|poori\s+(kitab|kitaab|book)|saar\s+(karo|batao?)|kahani\s+(batao|btao|kya)|kis\s+baare)\b/i.test(s)) return true;
+  return BOOK_WORD.test(s) && GLOBAL_ASK.test(s);
 }
 
 export function understandQuery({ message, recentMessages = [] }) {
@@ -243,7 +277,7 @@ export function understandQuery({ message, recentMessages = [] }) {
   const intent = kind === 'meta'
     ? (requested || /hindi|english|urdu|bhasha|translate|translation|anuvaad|matlab|language/i.test(original)
         ? 'language'
-        : original.toLowerCase().split(/[^\p{L}\p{N}']+/u).some((w) => FORM_REQUEST.has(w))
+        : original.toLowerCase().split(WORD_SEP).some((w) => FORM_REQUEST.has(w))
           ? 'form'
           : 'social')
     : null;
@@ -260,6 +294,9 @@ export function understandQuery({ message, recentMessages = [] }) {
     semanticNeeded: kind === 'book', // a meta turn has nothing to embed
     kind,
     intent,
+    // 'whole_book' asks about the book as a single thing; 'passage' asks about
+    // something at a particular place in it. Decides how wide to retrieve.
+    scope: kind === 'book' && isWholeBookQuestion(original) ? 'whole_book' : 'passage',
     language,
     contextMessageLimit: ragConfig.contextMessageLimit,
   };

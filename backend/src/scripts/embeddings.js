@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { assertEnv } from '../config/env.js';
 import { getPool, closePool } from '../db/pool.js';
 import { embedSource } from '../ingest/embedSource.js';
-import { embeddingConfigured } from '../ingest/embeddingProvider.js';
+import { embeddingConfigured, embeddingProviderInfo, embeddingSetupHint } from '../ingest/embeddingProvider.js';
 
 const HELP = `
 npm run ingest:embeddings -- --book <slug> --edition <label>
@@ -41,14 +41,17 @@ async function main() {
   }
   assertEnv();
   if (!getPool()) fail('DATABASE_URL is not set — embeddings write to PostgreSQL');
+  const info = embeddingProviderInfo();
+  console.log(`Embedding provider: ${info.provider}${info.model ? ` (${info.model})` : ''}`);
   if (!embeddingConfigured()) {
-    fail('EMBEDDING_NOT_CONFIGURED: set HUGGINGFACE_API_KEY and HF_EMBEDDING_MODEL');
+    fail(`EMBEDDING_NOT_CONFIGURED: ${embeddingSetupHint()}`);
   }
 
   try {
     const r = await embedSource({ slug: values.book, edition: values.edition, log: (...a) => console.log(...a) });
     console.log('\n============ EMBEDDING BACKFILL SUMMARY (real DB values) ============');
     console.log(`SOURCE          : ${values.book}/${values.edition}`);
+    console.log(`PROVIDER        : ${info.provider}${info.model ? ` (${info.model})` : ''}`);
     console.log(`TOTAL CHUNKS    : ${r.total}`);
     console.log(`EMBEDDED        : ${r.embedded}`);
     console.log(`NULL EMBEDDINGS : ${r.nullEmbeddings}`);
@@ -60,8 +63,12 @@ async function main() {
   } catch (err) {
     await closePool().catch(() => {});
     const code = err?.code || err?.message || 'EMBEDDING_JOB_FAILED';
+    // A dimension mismatch carries the exact stop-report (e.g.
+    // JINA_EMBEDDING_DIMENSION_MISMATCH expected=384 actual=1024) — print it in
+    // full instead of only the JSON detail.
+    const report = err?.detail?.report;
     const detail = err?.detail ? ` ${JSON.stringify(err.detail)}` : '';
-    fail(code + detail);
+    fail((report ? `${report}\n\n${code}` : code) + detail);
   }
 }
 

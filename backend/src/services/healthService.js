@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { getPool, dbAvailable } from '../db/pool.js';
 import { groqConfigured } from './groqService.js';
+import { embeddingProviderInfo } from '../ingest/embeddingProvider.js';
 
 // Production health snapshot (§31). Reports the ACTUAL state of each dependency
 // and never inflates: "configured" means the required env vars are present; it
@@ -32,14 +33,17 @@ export async function healthSnapshot() {
     out.storage = flag(Boolean(env.storageLocalDir));
   }
 
-  // Embedding: only "configured" when both key + model exist. Healthy is unknown
-  // here by design (a blocked/unreachable provider must not be masked as ready).
-  out.embedding = flag(Boolean(env.hfApiKey && env.hfEmbeddingModel));
+  // Embedding: "configured" means the SELECTED vendor has both key + model.
+  // Healthy is unknown here by design (a blocked/unreachable provider must not
+  // be masked as ready, and must never slow this endpoint down).
+  const embedding = embeddingProviderInfo();
+  out.embedding = flag(embedding.configured);
   // §32 honest shape: reachability is NOT probed on this hot path (a blocked
   // provider must never hang or crash health). verify:production does the live
   // probe. We only report what is guaranteed cheaply here.
   out.embeddingProvider = {
-    configured: Boolean(env.hfApiKey && env.hfEmbeddingModel),
+    provider: embedding.provider,
+    configured: embedding.configured,
     reachable: 'not_probed_on_health_path',
   };
   out.vectorIndex = { configured: false, populated: false };

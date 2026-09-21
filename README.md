@@ -55,8 +55,10 @@ cd frontend && npm install && npm run dev
 
 The Vite dev server proxies `/api` to the backend (see `frontend/vite.config.ts`).
 Set the values in `backend/.env` — database URL, Supabase storage credentials,
-Groq key, and optionally a Hugging Face embedding model. `.env` is git-ignored;
-only `.env.example` belongs in the repo, and it holds variable names, never values.
+Groq key, and the embedding vendor you select with `EMBEDDING_PROVIDER`
+(`jina` → `JINA_API_KEY` + `JINA_EMBEDDING_MODEL`, or `huggingface`). `.env` is
+git-ignored; only `.env.example` belongs in the repo, and it holds variable
+names, never values.
 
 Ingest a book (requires a text-layer PDF):
 

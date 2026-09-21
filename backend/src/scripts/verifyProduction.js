@@ -2,7 +2,7 @@ import { env } from '../config/env.js';
 import { getPool, query, closePool, dbAvailable } from '../db/pool.js';
 import { verifySourceIntegrity, makeStorageProvider } from '../services/storageService.js';
 import { groqConfigured } from '../services/groqService.js';
-import { probeDimension, makeEmbeddingProvider } from '../ingest/embeddingProvider.js';
+import { probeDimension, makeEmbeddingProvider, embeddingProviderInfo } from '../ingest/embeddingProvider.js';
 
 // §32 — Production readiness verification.
 //
@@ -161,8 +161,9 @@ async function checkStorageProvider() {
 }
 
 async function checkEmbeddingProvider() {
-  if (!(env.hfApiKey && env.hfEmbeddingModel)) {
-    record('WARN', 'EMBEDDINGS', 'provider not configured — lexical-only retrieval');
+  const info = embeddingProviderInfo();
+  if (!info.configured) {
+    record('WARN', 'EMBEDDINGS', `provider ${info.provider} not configured — lexical-only retrieval`);
     return;
   }
   // Attempt a real live probe. If the network blocks it (as in some sandboxes)
@@ -172,9 +173,9 @@ async function checkEmbeddingProvider() {
     const dim = await probeDimension(provider);
     const expected = env.embeddingDim;
     if (expected && dim !== expected) record('FAIL', 'EMBEDDINGS', `live dim=${dim} != configured EMBEDDING_DIM=${expected}`);
-    else record('PASS', 'EMBEDDINGS', `reachable model=${env.hfEmbeddingModel} dim=${dim}`);
+    else record('PASS', 'EMBEDDINGS', `provider=${info.provider} model=${info.model} reachable dim=${dim}`);
   } catch (e) {
-    record('WARN', 'EMBEDDINGS', `provider unreachable (${e.code || e.message}) — running lexical-only`);
+    record('WARN', 'EMBEDDINGS', `provider ${info.provider} unreachable (${e.code || e.message}) — running lexical-only`);
   }
 }
 

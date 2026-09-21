@@ -13,7 +13,7 @@ USER → Vercel (React + PDF.js) → HTTPS/SSE → Render (Express)
                                                  ├─ Supabase Postgres (schema "bookmark": pgvector + FTS)
                                                  ├─ Supabase Storage (production PDF, byte-range served)
                                                  ├─ Groq (grounded generation)
-                                                 └─ HuggingFace (embeddings — see "Embedding status")
+                                                 └─ Embeddings: Jina or HuggingFace (EMBEDDING_PROVIDER)
 ```
 
 ---
@@ -87,7 +87,9 @@ Guarantees (this job never auto-runs on server boot — it is an explicit comman
   with `EMBEDDING_PROVIDER_UNAVAILABLE` and leaves the database unchanged (no
   flood of failing requests).
 - Verifies the measured dimension equals `EMBEDDING_DIM` (and the column type);
-  a mismatch stops with `EMBEDDING_DIMENSION_MISMATCH` and never auto-migrates.
+  a mismatch stops with `EMBEDDING_DIMENSION_MISMATCH` (reported as
+  `JINA_EMBEDDING_DIMENSION_MISMATCH expected=<column> actual=<vendor>` for Jina)
+  and never auto-migrates.
 - Only rows with `embedding IS NULL` are selected, so re-running **resumes** where
   a crash/outage stopped — already-embedded chunks are never regenerated.
 - Writes in bounded batches (`EMBEDDING_BATCH_SIZE`), each in its own transaction;
@@ -133,7 +135,10 @@ work because they come from stored coordinates, not embeddings.
 | `SUPABASE_STORAGE_BUCKET` | e.g. `books` |
 | `STORAGE_BACKEND` | `supabase` |
 | `GROQ_API_KEY` / `GROQ_MODEL` | generation |
-| `HUGGINGFACE_API_KEY` / `HF_EMBEDDING_MODEL` / `EMBEDDING_DIM` | embeddings (optional if provider blocked) |
+| `EMBEDDING_PROVIDER` | `jina` (or `huggingface`) — the vendor is never inferred |
+| `JINA_API_KEY` / `JINA_EMBEDDING_MODEL` | Jina embeddings, e.g. `jina-embeddings-v3` |
+| `EMBEDDING_DIM` | `384` — the width of `literature_chunks.embedding`; it is also the `dimensions` requested from Jina, so no migration is needed |
+| `HUGGINGFACE_API_KEY` / `HF_EMBEDDING_MODEL` | only if `EMBEDDING_PROVIDER=huggingface` |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_RETRIES` / `EMBEDDING_RETRY_BASE_MS` | backfill batching + bounded retries |
 | `EMBEDDING_TIMEOUT_MS` | hard per-request ceiling so a blocked provider can't hang a job |
 | `EMBEDDING_CONCURRENCY` | keep `1` — one controlled batch at a time |

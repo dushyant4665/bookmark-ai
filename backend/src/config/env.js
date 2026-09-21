@@ -28,6 +28,12 @@ export const env = {
 
   hfApiKey: process.env.HUGGINGFACE_API_KEY || '',
   hfEmbeddingModel: process.env.HF_EMBEDDING_MODEL || '',
+  jinaApiKey: process.env.JINA_API_KEY || '',
+  jinaEmbeddingModel: process.env.JINA_EMBEDDING_MODEL || '',
+  // One explicit switch decides which vendor the embedding seam calls. It is
+  // deliberately NOT inferred from whichever keys happen to exist — a silent
+  // vendor swap would change the vector dimension without anyone choosing it.
+  embeddingProvider: (process.env.EMBEDDING_PROVIDER || 'huggingface').trim().toLowerCase(),
   embeddingDim: Number(process.env.EMBEDDING_DIM || 384),
 
   groqApiKey: process.env.GROQ_API_KEY || '',
@@ -52,6 +58,20 @@ export const env = {
   },
 };
 
+// Which env vars each supported vendor needs. Keeping the list here means the
+// provider factory, health and startup warnings can never disagree about what
+// "configured" means. Values are never read from this table — only presence.
+const PROVIDER_ENV_KEYS = {
+  huggingface: ['hfApiKey', 'hfEmbeddingModel'],
+  jina: ['jinaApiKey', 'jinaEmbeddingModel'],
+};
+
+export function embeddingReady() {
+  const keys = PROVIDER_ENV_KEYS[env.embeddingProvider];
+  if (!keys) return false;
+  return keys.every((k) => Boolean(env[k]));
+}
+
 export function assertEnv() {
   const problems = [];
   if (env.isProd) {
@@ -66,6 +86,14 @@ export function assertEnv() {
       console.warn('[env] CORS_ORIGINS still contains a localhost origin in production');
     }
     if (!env.groqApiKey) console.warn('[env] GROQ_API_KEY not set — answers cannot be generated');
+    // An incomplete embedding vendor is a degraded mode, not a boot failure:
+    // retrieval falls back to real PostgreSQL full-text search. Warn only, and
+    // never print values.
+    if (!PROVIDER_ENV_KEYS[env.embeddingProvider]) {
+      console.warn(`[env] unknown EMBEDDING_PROVIDER "${env.embeddingProvider}" (use jina or huggingface)`);
+    } else if (!embeddingReady()) {
+      console.warn(`[env] EMBEDDING_PROVIDER=${env.embeddingProvider} but its key/model env vars are incomplete — running lexical-only`);
+    }
     if (env.storageBackend === 'supabase' && !(env.supabaseUrl && env.supabaseServiceRoleKey && env.supabaseStorageBucket)) {
       problems.push('STORAGE_BACKEND=supabase requires SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_STORAGE_BUCKET');
     }

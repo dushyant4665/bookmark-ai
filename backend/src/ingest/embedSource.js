@@ -40,6 +40,19 @@ class EmbedSourceError extends Error {
 // Fixed advisory-lock "classid" so our locks never collide with other apps.
 const LOCK_CLASSID = 61_520; // "BOOKMARK embeddings"
 
+// §4 dimension guard report. The message carries the exact expected/actual
+// numbers so the operator can decide the migration; nothing here migrates,
+// truncates or pads a vector, and the caller stops before any chunk is written.
+function dimensionMismatch(provider, expected, actual) {
+  const label = provider?.name === 'jina' ? 'JINA_EMBEDDING_DIMENSION_MISMATCH' : 'EMBEDDING_DIMENSION_MISMATCH';
+  return new EmbedSourceError('EMBEDDING_DIMENSION_MISMATCH', {
+    report: `${label} expected=${expected} actual=${actual}`,
+    provider: provider?.name ?? 'unknown',
+    expected,
+    actual,
+  });
+}
+
 // Resolve the (book -> edition -> source) ownership chain from slug + label.
 // Returns null if any link is missing (§9: never embed the wrong book).
 async function resolveSource(client, { slug, edition }) {
@@ -137,17 +150,11 @@ export async function embedSource(opts = {}) {
     }
 
     // ---- §12/§36 dimension must match the DB column; never auto-migrate ----
-    if (expectedDim && dim !== expectedDim) {
-      throw new EmbedSourceError('EMBEDDING_DIMENSION_MISMATCH', {
-        provider_dim: dim,
-        configured_dim: expectedDim,
-      });
+    if (expectedDim != null && dim !== expectedDim) {
+      throw dimensionMismatch(provider, expectedDim, dim);
     }
     if (scope.embedding_dim && scope.embedding_dim !== dim) {
-      throw new EmbedSourceError('EMBEDDING_DIMENSION_MISMATCH', {
-        provider_dim: dim,
-        source_dim: scope.embedding_dim,
-      });
+      throw dimensionMismatch(provider, scope.embedding_dim, dim);
     }
 
     // ---- §17 real progress from real DB counts ----
@@ -160,10 +167,7 @@ export async function embedSource(opts = {}) {
     log(`  Remaining: ${total - c.embedded}`);
     if (total === 0) throw new EmbedSourceError('SOURCE_HAS_NO_CHUNKS', { sourceId });
     if (c.live_dim && c.live_dim !== dim) {
-      throw new EmbedSourceError('EMBEDDING_DIMENSION_MISMATCH', {
-        provider_dim: dim,
-        stored_dim: c.live_dim,
-      });
+      throw dimensionMismatch(provider, c.live_dim, dim);
     }
     if (c.embedded === total) {
       log('  All chunks already embedded — nothing to do.');
@@ -172,7 +176,6 @@ export async function embedSource(opts = {}) {
 
     // ---- §7/§15/§18 batched, resumable, memory-bounded loop ----
     const batchSize = config.embeddingBatchSize || 32;
-    let processed = 0;
     let batchNo = 0;
     // We always re-select the NEXT still-NULL rows, so an interruption resumes
     // with zero wasted work and a concurrent writer can never double-embed.
@@ -193,10 +196,10 @@ export async function embedSource(opts = {}) {
       validateVectors(raw, dim);
       await writeBatch(client, rows.map((r, i) => ({ id: r.id, vector: raw[i] })));
 
-      processed += rows.length;
-      log(`  Batch ${batchNo}: ${c.embedded + processed}/${total}`);
-      // Re-read truth (also catches external changes) — never trust the counter alone.
+      // Re-read truth (also catches external changes) — the progress line reports
+      // what the database actually holds, never a locally counted number.
       c = await countsFor(client, sourceId);
+      log(`  Batch ${batchNo}: ${c.embedded}/${total} embedded in DB`);
     }
 
     // ---- §20 post-embedding validation against real DB values ----
